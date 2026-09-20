@@ -50,6 +50,18 @@
           "default": null,
           "title": "Bbox"
         },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
+        },
         "content": {
           "items": {
             "discriminator": {
@@ -140,6 +152,18 @@
           "default": null,
           "title": "Bbox"
         },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
+        },
         "content": {
           "items": {
             "discriminator": {
@@ -225,6 +249,18 @@
           ],
           "default": null,
           "title": "Bbox"
+        },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
         },
         "content": {
           "items": {
@@ -316,6 +352,18 @@
           ],
           "default": null,
           "title": "Bbox"
+        },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
         },
         "image_base64": {
           "anyOf": [
@@ -418,6 +466,18 @@
           "default": null,
           "title": "Bbox"
         },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
+        },
         "content": {
           "items": {
             "discriminator": {
@@ -503,6 +563,18 @@
           ],
           "default": null,
           "title": "Bbox"
+        },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
         },
         "content": {
           "items": {
@@ -608,6 +680,18 @@
           "default": null,
           "title": "Bbox"
         },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
+        },
         "content": {
           "title": "Content",
           "type": "string"
@@ -690,6 +774,18 @@
           ],
           "default": null,
           "title": "Bbox"
+        },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
         },
         "content": {
           "items": {
@@ -1009,6 +1105,18 @@
           "default": null,
           "title": "Bbox"
         },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
+        },
         "image_base64": {
           "anyOf": [
             {
@@ -1181,6 +1289,18 @@
           "default": null,
           "title": "Bbox"
         },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
+        },
         "content": {
           "items": {
             "discriminator": {
@@ -1266,6 +1386,18 @@
           ],
           "default": null,
           "title": "Bbox"
+        },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
         },
         "content": {
           "items": {
@@ -1357,6 +1489,18 @@
           ],
           "default": null,
           "title": "Bbox"
+        },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
         },
         "image_base64": {
           "anyOf": [
@@ -1455,6 +1599,18 @@
           "default": null,
           "title": "Bbox"
         },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
+        },
         "content": {
           "items": {
             "discriminator": {
@@ -1541,6 +1697,18 @@
           ],
           "default": null,
           "title": "Bbox"
+        },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
         },
         "content": {
           "items": {
@@ -1658,6 +1826,18 @@
           "default": null,
           "title": "Bbox"
         },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
+        },
         "content": {
           "items": {
             "discriminator": {
@@ -1744,6 +1924,18 @@
           ],
           "default": null,
           "title": "Bbox"
+        },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
         },
         "content": {
           "items": {
@@ -1927,6 +2119,18 @@
           "default": null,
           "title": "Bbox"
         },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
+        },
         "content": {
           "items": {
             "discriminator": {
@@ -2054,6 +2258,18 @@
           "default": null,
           "title": "Bbox"
         },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
+        },
         "content": {
           "items": {
             "discriminator": {
@@ -2156,6 +2372,18 @@
           "default": null,
           "title": "Bbox"
         },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
+        },
         "content": {
           "items": {
             "discriminator": {
@@ -2241,6 +2469,18 @@
           ],
           "default": null,
           "title": "Bbox"
+        },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
         },
         "content": {
           "items": {
@@ -2352,6 +2592,18 @@
           "default": null,
           "title": "Bbox"
         },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
+        },
         "image_base64": {
           "anyOf": [
             {
@@ -2448,6 +2700,18 @@
           ],
           "default": null,
           "title": "Bbox"
+        },
+        "block_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Block Id"
         },
         "content": {
           "items": {

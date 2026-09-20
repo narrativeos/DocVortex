@@ -466,6 +466,9 @@ class BlockBase(_StrictMiddleModel):
     type: BlockTypes
     index: int | None = Field(default=None, ge=0)
     bbox: BBox | None = None
+    # 可选的稳定 block 标识（如生产者派生的 UUIDv5），用于跨次解析的
+    # block 级溯源与 diff；协议不约束格式，由生产者保证确定性与唯一性。
+    block_id: str | None = None
 
     @field_validator("bbox", mode="before")
     @classmethod
