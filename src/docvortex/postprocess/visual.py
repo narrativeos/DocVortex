@@ -477,6 +477,9 @@ def regroup_visual_blocks(
             two_layer_block["cell_merge"] = table_cell_merge
         if "bbox" in main_block:
             two_layer_block["bbox"] = deepcopy(main_block["bbox"])
+        # 视觉父块继承主体的稳定标识，保证重组后 block_id 不丢失。
+        if main_block.get("block_id") is not None:
+            two_layer_block["block_id"] = main_block["block_id"]
 
         grouped_blocks[visual_type].append(two_layer_block)
 
