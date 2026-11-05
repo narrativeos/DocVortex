@@ -1091,9 +1091,21 @@ def _resolve_document_title(middle_json: MiddleJson, explicit_title: str | None)
     return "DocVortex Document"
 
 
+def _drop_block_ids(node: object) -> None:
+    """就地去掉块级记账字段；block_id 不属于文档内容，不应影响内容指纹。"""
+    if isinstance(node, dict):
+        node.pop("block_id", None)
+        for value in node.values():
+            _drop_block_ids(value)
+    elif isinstance(node, list):
+        for value in node:
+            _drop_block_ids(value)
+
+
 def _stable_identifier(middle_json: MiddleJson, *, title: str, authors: tuple[str, ...], language: str) -> str:
     """由规范化 MiddleJson 和不随渲染时间变化的元数据生成稳定 UUID URN。"""
     document_payload = middle_json.model_dump(mode="json")
+    _drop_block_ids(document_payload)
     # 新增说明书签的默认空值不参与内容指纹，保留旧文档的确定性 EPUB 标识。
     for page in document_payload["pages"]:
         for block in page["blocks"]:
