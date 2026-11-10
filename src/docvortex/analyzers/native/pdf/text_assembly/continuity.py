@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import re
 import statistics
+import unicodedata
 
-from ..geometry import _bbox_axis_overlap_ratio, _bbox_center_y, _rotate_bbox_to_upright
+from ..geometry import _bbox_axis_overlap_ratio, _bbox_center_y, _rotate_bbox_to_upright, _bbox_union_many
 from ..line_layout import _line_effective_height
 from ..layout_evidence import build_layout_evidence
 from ..text_roles import text_role, metadata_field
@@ -13,7 +14,118 @@ from ..models import _LineItem, _PreparedPage
 from .common import _merge_internal_text_block_group, _merge_text_line_content
 
 
-_REFERENCE_NUMBER = re.compile(r"^\s*(?:\[(\d{1,4})\]|(\d{1,3})[.])\s*(?=\D)")
+_REFERENCE_NUMBER = re.compile(r"^\s*(?:[\[［](\d{1,4})[\]］]|(\d{1,3})[.])\s*(?=\D)")
+
+
+def _is_reference_heading(text: str) -> bool:
+    """参考标题允许汉字间排版空白；匹配时归一化而不改写原文内容。"""
+    compact = re.sub(r"\s+", "", text).rstrip(":：").strip("[]［］【】()（）")
+    return bool(re.fullmatch(r"(?:references|bibliography|参考文献(?:[（(]references[）)])?)", compact, re.I))
+
+
+def group_native_inline_formula_prose(lines: list[_LineItem], regions: list[tuple]) -> None:
+    """至少两处原生行内矢量公式证明同式正文连续带，公式槽位纳入行宽且字体重置阻断段组。"""
+    if len(regions) < 2:
+        return
+    rows = []
+    eligible = [
+        line
+        for line in lines
+        if line.angle == 0
+        and line.semantic_type is None
+        and not line.caption_start
+        and line.paragraph_group is None
+        and line.font_signature is not None
+    ]
+    for line in sorted(eligible, key=lambda item: (item.bbox[1], item.bbox[0])):
+        same = [
+            row
+            for row in rows
+            if row[0].visual_row_id is not None
+            and row[0].visual_row_id == line.visual_row_id
+            and row[0].font_signature == line.font_signature
+        ]
+        if same:
+            same[0].append(line)
+        else:
+            rows.append([line])
+    by_source = {line.source_index: row for row in rows for line in row}
+    boxes = {id(row): _bbox_union_many([line.bbox for line in row]) for row in rows}
+    hits = {id(row): set() for row in rows}
+    for index, (bounds, sources) in enumerate(regions):
+        for source in sources:
+            row = by_source.get(source)
+            if row is not None:
+                boxes[id(row)] = _bbox_union_many([boxes[id(row)], bounds])
+                hits[id(row)].add(index)
+    pending = sorted(rows, key=lambda row: boxes[id(row)][1])
+    group = max((line.paragraph_group for line in lines if line.paragraph_group is not None), default=-1) + 1
+    while pending:
+        run = [pending.pop(0)]
+        em = statistics.median(_line_effective_height(line, line.bbox) for line in run[0])
+        while pending:
+            before = boxes[id(run[-1])]
+            current = pending[0]
+            bounds = boxes[id(current)]
+            if (
+                current[0].font_signature != run[0][0].font_signature
+                or any(not 0.85 <= _line_effective_height(line, line.bbox) / em <= 1.15 for line in current)
+                or not -0.15 * em <= bounds[1] - before[3] <= 0.8 * em
+                or _bbox_axis_overlap_ratio(before, bounds, axis="x") < 0.5
+            ):
+                break
+            run.append(pending.pop(0))
+        text = " ".join(line.text for row in run for line in row)
+        if (
+            len(run) < 3
+            or len(set().union(*(hits[id(row)] for row in run))) < 2
+            or len(re.findall(r"\b[A-Za-z]{2,}\b", text)) < 20
+        ):
+            continue
+        for row in run:
+            for line in row:
+                line.paragraph_group = group
+                line.semantic_type = "text"
+                line.title_suppressed = True
+        group += 1
+
+
+def _standalone_author_year_regions(page: _PreparedPage) -> list[tuple]:
+    """单页缺少参考文献标题时，以重复作者行、年代和悬挂缩进共同确认局部参考栏。"""
+    lines = [
+        line
+        for line in page.remaining_lines
+        if line.angle == 0 and line.semantic_type not in {"header", "footer", "page_number", "page_footnote"}
+    ]
+    if len(lines) < 15:
+        return []
+    layout = build_layout_evidence(lines, page.page_size, barriers=[block["bbox"] for block in page.fixed_blocks])
+    regions = []
+    for left, right in sorted(set(layout.corridor((lane.left, 0, lane.right, 1)) for lane in layout.lanes)):
+        members = [line for line in lines if left <= (line.bbox[0] + line.bbox[2]) / 2 < right]
+        if len(members) < 15:
+            continue
+        em = statistics.median(_line_effective_height(line, line.bbox) for line in members)
+        edge = min(line.bbox[0] for line in members)
+        starts = [
+            line
+            for line in members
+            if abs(line.bbox[0] - edge) <= 0.4 * em
+            and line.text.count(",") >= 2
+            and re.match(r"^[A-Z][^,]+,\s*[A-Z]", line.text)
+        ]
+        indented = [line for line in members if 0.5 * em < line.bbox[0] - edge < 2 * em]
+        dated = [line for line in members if re.search(r"\b(?:19|20)\d{2}[a-z]?\.", line.text)]
+        if len(starts) >= 4 and len(dated) >= 4 and len(indented) >= len(members) / 3:
+            regions.append(
+                (
+                    left,
+                    min(line.bbox[1] for line in members) - 0.2 * em,
+                    right,
+                    max(line.bbox[3] for line in members) + 0.2 * em,
+                )
+            )
+    return regions
 
 
 def _numbered_reference_regions(page: _PreparedPage, active: bool) -> list[tuple]:
@@ -33,6 +145,19 @@ def _numbered_reference_regions(page: _PreparedPage, active: bool) -> list[tuple
     accepted = []
     for cluster in clusters:
         cluster.sort(key=lambda item: item[0].bbox[1])
+        # 参考标题所在栏可能仅容纳首条，随后条目移到下一栏；标题和方括号共同确认它。
+        if (
+            len(cluster) == 1
+            and cluster[0][2]
+            and any(
+                _is_reference_heading(line.text)
+                and line.bbox[3] <= cluster[0][0].bbox[1]
+                and _bbox_axis_overlap_ratio(line.bbox, cluster[0][0].bbox, axis="x") >= 0.5
+                for line in page.remaining_lines
+            )
+        ):
+            accepted.append(cluster)
+            continue
         minimum = 2 if active else 3
         if len(cluster) < minimum or sum(b[1] == a[1] + 1 for a, b in zip(cluster, cluster[1:])) < minimum - 1:
             continue
@@ -41,6 +166,9 @@ def _numbered_reference_regions(page: _PreparedPage, active: bool) -> list[tuple
         accepted.append(cluster)
     if not accepted:
         return []
+    page.bracketed_reference_numbers = sum(item[2] for cluster in accepted for item in cluster) >= 0.75 * sum(
+        len(cluster) for cluster in accepted
+    )
     accepted.sort(key=lambda c: c[0][0].bbox[0])
     regions = []
     for i, cluster in enumerate(accepted):
@@ -48,17 +176,9 @@ def _numbered_reference_regions(page: _PreparedPage, active: bool) -> list[tuple
         left = statistics.median(v[0].bbox[0] for v in cluster)
         next_left = min(v[0].bbox[0] for v in accepted[i + 1]) if i + 1 < len(accepted) else page.page_size[0]
         top = min(v[0].bbox[1] for v in cluster)
-        headings = [
-            line for line in page.remaining_lines if re.fullmatch(r"references|bibliography|参考文献", line.text.strip(), re.I)
-        ]
+        headings = [line for line in page.remaining_lines if _is_reference_heading(line.text)]
         local_headings = [line for line in headings if left - em <= line.bbox[0] < next_left - em]
-        floor = (
-            max(line.bbox[3] for line in local_headings)
-            if local_headings
-            else min(line.bbox[1] for line in headings) - 0.5 * em
-            if headings
-            else 0.0
-        )
+        floor = max(line.bbox[3] for line in local_headings) if local_headings else 0.0
         # 后栏首项前可能有上一条的续行，但必须与参考文字同字号、同左缘。
         if active or i:
             peers = [
@@ -70,7 +190,7 @@ def _numbered_reference_regions(page: _PreparedPage, active: bool) -> list[tuple
                 and peer.semantic_type not in {"header", "footer", "page_number"}
                 and not peer.structural_title
                 and not peer.explicit_section_title
-                and not re.fullmatch(r"references|bibliography|参考文献", peer.text.strip(), re.I)
+                and not _is_reference_heading(peer.text)
                 and 0.85 <= _line_effective_height(peer, peer.bbox) / em <= 1.15
             ]
             if peers:
@@ -95,6 +215,22 @@ def _numbered_reference_regions(page: _PreparedPage, active: bool) -> list[tuple
                 )
             )
         ]
+        # 后页译文的通栏题名和独立摘要形成参考区屏障，不能把译文压进左栏末条文献。
+        abstract_tops = [
+            line.bbox[1]
+            for line in page.remaining_lines
+            if re.match(r"^\s*(?:abstract|摘要)\s*[:：]", unicodedata.normalize("NFKC", line.text), re.I)
+        ]
+        endings.extend(
+            line.bbox[1]
+            for line in page.remaining_lines
+            if line.bbox[1] > top
+            and line.bbox[2] - line.bbox[0] >= 0.6 * page.page_size[0]
+            and abs((line.bbox[0] + line.bbox[2]) / 2 - page.page_size[0] / 2) <= 0.05 * page.page_size[0]
+            and len(re.findall(r"[A-Za-z]", unicodedata.normalize("NFKC", line.text))) >= 20
+            and not _REFERENCE_NUMBER.match(line.text)
+            and any(2 * em <= abstract - line.bbox[3] <= 20 * em for abstract in abstract_tops)
+        )
         regions.append((left - em, top - 0.2 * em, next_left - em, min(endings) if endings else 0.94 * page.page_size[1]))
     return regions
 
@@ -106,11 +242,7 @@ def mark_document_reference_regions(pages: list[_PreparedPage]) -> None:
     for page in pages:
         _width, height = page.page_size
         lines = page.remaining_lines
-        headings = {
-            line.source_index
-            for line in lines
-            if re.fullmatch(r"(?:references|bibliography|参考文献)\s*[:：]?", line.text.strip(), re.IGNORECASE)
-        }
+        headings = {line.source_index for line in lines if _is_reference_heading(line.text)}
         # 作者年代式参考区不能为后续附录的普通数字列表提供编号文献证据。
         numbered = _numbered_reference_regions(page, numbered_active or bool(headings))
         if numbered:
@@ -126,8 +258,12 @@ def mark_document_reference_regions(pages: list[_PreparedPage]) -> None:
             active = numbered[-1][3] == 0.94 * height
             numbered_active = active
             continue
+        # 编号式参考区必须在下一页继续得到编号证据，不能退化为整页作者年代区。
+        if numbered_active:
+            active = False
         numbered_active = False
         if not active and not headings:
+            page.reference_regions.extend(_standalone_author_year_regions(page))
             continue
         layout = build_layout_evidence(lines, page.page_size, barriers=[block["bbox"] for block in page.fixed_blocks])
         corridors = sorted(set(layout.corridor((lane.left, 0, lane.right, 1)) for lane in layout.lanes))
@@ -165,8 +301,10 @@ def group_reference_lines(lines: list[_LineItem], page: _PreparedPage) -> None:
             and region[1] <= _bbox_center_y(line.bbox) <= region[3]
             and line.semantic_type not in {"page_number", "doc_title", "header", "footer"}
             and (page.numbered_references or line.semantic_type != "page_footnote")
+            and (not page.numbered_references or line.bbox[2] - line.bbox[0] <= 1.15 * (region[2] - region[0]))
+            and (not page.numbered_references or re.search(r"[^\W_]", line.text))
         ]
-        if len(members) < 3:
+        if len(members) < (1 if page.numbered_references else 3):
             continue
         em = statistics.median(_line_effective_height(line, line.bbox) for line in members)
         left = min(line.bbox[0] for line in members)
@@ -186,12 +324,15 @@ def group_reference_lines(lines: list[_LineItem], page: _PreparedPage) -> None:
                 re.IGNORECASE,
             )
         )
+        biography_tops.extend(
+            line.bbox[1] for line in members if re.match(r"^\s*[［\[]?\s*(?:责任编辑|编者|编辑说明)\s*[:：]", line.text)
+        )
         if biography_tops:
             members = [line for line in members if line.bbox[1] < min(biography_tops)]
         # 没有重复首行和续行缩进就不推断条目，以免普通附注变成逐行段落。
         if sum(abs(line.bbox[0] - left) <= 0.5 * em for line in members) < 1:
             continue
-        numbered = page.numbered_references and sum(bool(_REFERENCE_NUMBER.match(line.text)) for line in members) >= 2
+        numbered = page.numbered_references and any(_reference_entry_number(line.text, page) for line in members)
         if not numbered and sum(0.5 * em < line.bbox[0] - left < 4 * em for line in members) < 2:
             continue
         rows: list[list[_LineItem]] = []
@@ -206,7 +347,7 @@ def group_reference_lines(lines: list[_LineItem], page: _PreparedPage) -> None:
                 rows.append([line])
         for index, row in enumerate(rows):
             row.sort(key=lambda line: line.bbox[0])
-            starts = bool(_REFERENCE_NUMBER.match(row[0].text)) or (not numbered and row[0].bbox[0] - left <= 0.5 * em)
+            starts = bool(_reference_entry_number(row[0].text, page)) or (not numbered and row[0].bbox[0] - left <= 0.5 * em)
             if index == 0 or starts:
                 group += 1
             for line in row:
@@ -217,6 +358,12 @@ def group_reference_lines(lines: list[_LineItem], page: _PreparedPage) -> None:
                 line.title_suppressed = True
         claimed = {line.source_index for line in members}
         page.page_footnote_groups = [group - claimed for group in page.page_footnote_groups if group - claimed]
+
+
+def _reference_entry_number(text: str, page: _PreparedPage):
+    """沿已确认的文献编号样式判定首行，拒绝方括号条目中以页码句点开头的续行。"""
+    match = _REFERENCE_NUMBER.match(text)
+    return match if match and (not page.bracketed_reference_numbers or match.group(1)) else None
 
 
 def _reassemble_member_lines(members: list[_LineItem], previous_content: str = "") -> str:

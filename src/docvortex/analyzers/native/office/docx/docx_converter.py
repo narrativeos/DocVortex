@@ -14,6 +14,7 @@ from .....schema import RAW_CAPTION
 from .equationxml import DocxEquationXmlDecoder
 from .package_normalizer import normalize_docx_package
 from .....schema import BlockType
+from .....foundation.ooxml_zip import validate_ooxml_package
 from .....content.spans import (
     append_text_span,
     extend_inline_spans,
@@ -48,6 +49,8 @@ class DocxConverter(_DocxConstants, _DocxResources, _DocxStyles, _DocxNumbering,
 
     def _reset_document_state(self) -> None:
         """每次转换重新创建可变状态及解码器，避免失败或复用实例残留旧文档。"""
+        self._close_mammoth_fallback_context()
+        self._fallback_docx_bytes: Optional[bytes] = None  # 仅转换期间保留规范化后的原包
         self.docx_obj = None
         self.pages = []
         self.cur_page = []
@@ -149,19 +152,26 @@ class DocxConverter(_DocxConstants, _DocxResources, _DocxStyles, _DocxNumbering,
         self._reset_document_state()
         # 读取文件字节，以便 mammoth 和 python-docx 各自使用独立读取流
         file_bytes = self._sanitize_missing_internal_relationships(file_stream.read())
-        # 使用完整 DOCX 上下文预解析顶层表格，避免转换非表格正文带来的资源浪费
-        self._mammoth_tables_html = self._preparse_tables_with_mammoth(file_bytes)
-        self._mammoth_table_idx = 0
-        self.docx_obj = Document(BytesIO(file_bytes))
-        self.toc_anchor_set = self._collect_toc_anchor_set()
-        self.toc_anchor_aliases = self._collect_toc_anchor_aliases(
-            self.toc_anchor_set,
-        )
-        # 预扫描文档，识别用作章节标题的列表numId
-        self.heading_list_numids = self._detect_heading_list_numids()
-        self.pages.append(self.cur_page)
-        self._walk_linear(self.docx_obj.element.body)
-        self._add_header_footer(self.docx_obj)
+        validate_ooxml_package(file_bytes)
+        self._fallback_docx_bytes = file_bytes
+        try:
+            # 正文和表格对齐共享本次转换的文档，避免重复解压并构建同一棵 OOXML 树。
+            self.docx_obj = Document(BytesIO(file_bytes))
+            # 使用完整 DOCX 上下文预解析顶层表格，避免转换非表格正文带来的资源浪费
+            self._mammoth_tables_html = self._preparse_tables_with_mammoth(file_bytes)
+            self._mammoth_table_idx = 0
+            self.toc_anchor_set = self._collect_toc_anchor_set()
+            self.toc_anchor_aliases = self._collect_toc_anchor_aliases(
+                self.toc_anchor_set,
+            )
+            # 预扫描文档，识别用作章节标题的列表numId
+            self.heading_list_numids = self._detect_heading_list_numids()
+            self.pages.append(self.cur_page)
+            self._walk_linear(self.docx_obj.element.body)
+            self._add_header_footer(self.docx_obj)
+        finally:
+            self._close_mammoth_fallback_context()
+            self._fallback_docx_bytes = None
 
     def _close_active_list(self) -> None:
         """关闭当前活跃列表块，但保留 Word numId 的连续编号计数。"""
@@ -477,6 +487,8 @@ class DocxConverter(_DocxConstants, _DocxResources, _DocxStyles, _DocxNumbering,
                     "type": RAW_CAPTION,
                     "content": content_text,
                 }
+                if paragraph_anchor:
+                    caption_block["anchor"] = paragraph_anchor
                 self.cur_page.append(caption_block)
         else:
             # 文本样式名称不仅有默认值，还可能有用户自定义值

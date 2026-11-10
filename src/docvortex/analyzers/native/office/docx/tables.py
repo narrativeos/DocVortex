@@ -1,21 +1,50 @@
 """DOCX 表格处理；共享当前 Converter 的单文档状态。"""
 
+import base64
 import re
+from contextlib import ExitStack
+from functools import partial
+from html import escape
 from io import BytesIO
 from typing import Any, Optional
 from docx import Document
+from docx.text.paragraph import Paragraph
+from docx.text.run import Run
+from ..rich_text import OfficeRichTextSegment, build_rich_text_html_from_segments, formatting_to_style_str
 from docx.oxml.xmlchemy import BaseOxmlElement
 from loguru import logger
+from mammoth import docx as mammoth_docx, images as mammoth_images
+from mammoth import read_embedded_style_map
 from mammoth.conversion import convert_document_element_to_html
-from mammoth.docx import body_xml
+from mammoth.options import read_options
+from mammoth.zips import open_zip
 from .office_xml import read_str
 from .....schema import BlockType
+from .....content.links import OFFICE_EXTERNAL_HYPERLINK_SCHEMES, sanitize_hyperlink_target
 
 from .context import _DocxConstants
+from ..image import is_valid_vector_image_payload, is_vector_image_part, serialize_office_image
+from ..equation.image import OfficeImageEquationDecoder
+
+
+def _convert_mammoth_table_image(image: Any, *, equation_decoder: OfficeImageEquationDecoder) -> dict[str, str]:
+    """把表格内 WMF/EMF 转为可导出的图片，普通位图保持原始载荷。"""
+    with image.open() as stream:
+        payload = stream.read()
+    probe = equation_decoder.probe(payload, part_name="DOCX table image", content_type=image.content_type)
+    if probe.limit_reason or is_vector_image_part(content_type=image.content_type) or is_valid_vector_image_payload(payload):
+        source = serialize_office_image(payload, content_type=image.content_type, equation_decoder=equation_decoder)
+    else:
+        source = f"data:{image.content_type};base64,{base64.b64encode(payload).decode('ascii')}"
+    return {"src": source}
 
 
 class _DocxTables:
     """集中维护表格，不自行创建文档或持有跨文档缓存。"""
+
+    def _mammoth_image_converter(self):
+        """为预解析和回退绑定同一个文档级探测器，禁止先渲染后检查。"""
+        return mammoth_images.img_element(partial(_convert_mammoth_table_image, equation_decoder=self._image_equation_decoder))
 
     @staticmethod
     def _mammoth_top_level_table_document(document):
@@ -43,25 +72,32 @@ class _DocxTables:
 
         Returns:
             list[str | None]: 与正文顶层表格对齐的 HTML 列表；None 表示该表格
-                未找到可靠 Mammoth 结果，后续走孤立 XML 回退解析
+                未找到可靠 Mammoth 结果，后续走完整文档上下文回退解析
         """
         try:
+            # 仅在当前 convert 的字节对象和文档同时有效时复用；独立调用不能借用上一份文档。
+            docx_obj = (
+                self.docx_obj
+                if self._fallback_docx_bytes is file_bytes and self.docx_obj is not None
+                else Document(BytesIO(file_bytes))
+            )
+            xml_top_tables = [elem for elem in docx_obj.element.body if self._local_name(elem) == "tbl"]
+            if not xml_top_tables:
+                return []
+
             import mammoth as _mammoth
             from bs4 import BeautifulSoup as _BeautifulSoup
 
             result = _mammoth.convert_to_html(
                 BytesIO(file_bytes),
                 transform_document=self._mammoth_top_level_table_document,
+                convert_image=self._mammoth_image_converter(),
             )
             soup = _BeautifulSoup(result.value, "html.parser")
 
             # 仅保留顶层表格，排除嵌套在其他表格单元格内的子表格
             all_tables = soup.find_all("table")
             top_level_tables = [t for t in all_tables if not t.find_parent("table")]
-
-            # 同步加载 DOCX XML，获取所有顶层表格元素，用于公式注入
-            docx_obj = Document(BytesIO(file_bytes))
-            xml_top_tables = [elem for elem in docx_obj.element.body if self._local_name(elem) == "tbl"]
 
             logger.debug(f"Pre-parsed {len(top_level_tables)} top-level tables via filtered mammoth conversion")
 
@@ -93,13 +129,17 @@ class _DocxTables:
         aligned_tables = []
         html_index = 0
         matched_count = 0
+        html_signatures = {}
 
         for xml_table in xml_tables:
+            xml_signature = self._xml_table_signature(xml_table)
             matched_html_table = None
             scan_index = html_index
             while scan_index < len(html_tables):
                 candidate = html_tables[scan_index]
-                if self._mammoth_table_matches_xml_table(candidate, xml_table):
+                if scan_index not in html_signatures:
+                    html_signatures[scan_index] = self._html_table_signature(candidate)
+                if self._table_signatures_match(xml_signature, html_signatures[scan_index]):
                     matched_html_table = candidate
                     html_index = scan_index + 1
                     matched_count += 1
@@ -131,7 +171,11 @@ class _DocxTables:
         """
         xml_signature = _DocxTables._xml_table_signature(xml_table)
         html_signature = _DocxTables._html_table_signature(html_table)
+        return _DocxTables._table_signatures_match(xml_signature, html_signature)
 
+    @staticmethod
+    def _table_signatures_match(xml_signature: dict, html_signature: dict) -> bool:
+        """比较已提取的表格签名，供一次对齐过程复用未修改候选的统计。"""
         if xml_signature["text"] or html_signature["text"]:
             if not _DocxTables._table_text_matches(xml_signature["text"], html_signature["text"]):
                 return False
@@ -185,7 +229,8 @@ class _DocxTables:
         """提取与 Mammoth 渲染规则一致的 XML 表格轻量签名。
 
         按文档顺序收集 w:t 及特殊字符元素，并且只处理 WordprocessingML
-        命名空间，以排除 Mammoth 不渲染的 OMML m:t 公式文本。
+        命名空间，以排除 Mammoth 不渲染的 OMML m:t 公式文本。纵向合并的
+        continuation 单元格会被 Mammoth 折叠掉，因此其整个子树也不参与文本签名。
         """
         w_ns = _DocxConstants._BLIP_NAMESPACES["w"]
         char_tags = (
@@ -194,7 +239,53 @@ class _DocxTables:
             f"{{{w_ns}}}softHyphen",
             f"{{{w_ns}}}sym",
         )
-        text = "".join(_DocxTables._xml_table_char_fragment(node) for node in xml_table.iter() if node.tag in char_tags)
+        continuation_nodes = set()
+        for cell in xml_table.iter(f"{{{w_ns}}}tc"):
+            properties = cell.find(f"{{{w_ns}}}tcPr")
+            vmerge = properties.find(f"{{{w_ns}}}vMerge") if properties is not None else None
+            if vmerge is None:
+                continue
+            # Mammoth 将缺少 val 或 val=continue 的单元格视为 continuation，
+            # 并在计算 rowspan 时丢弃该单元格的全部内容。
+            if vmerge.get(f"{{{w_ns}}}val") in (None, "continue"):
+                continuation_nodes.update(cell.iter())
+
+        ignored_nodes = set(continuation_nodes)
+        mc_ns = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+        for alternate in xml_table.iter(f"{{{mc_ns}}}AlternateContent"):
+            # Mammoth 的 Office XML 读取器仅展开 Fallback 分支。
+            for branch in alternate:
+                if branch.tag != f"{{{mc_ns}}}Fallback":
+                    ignored_nodes.update(branch.iter())
+        for simple_field in xml_table.iter(f"{{{w_ns}}}fldSimple"):
+            # Mammoth 不解析简单域，其内部的缓存文字也不参与匹配。
+            ignored_nodes.update(simple_field.iter())
+
+        wordml_ns = "http://schemas.microsoft.com/office/word/2010/wordml"
+        for content_control in xml_table.iter(f"{{{w_ns}}}sdt"):
+            properties = content_control.find(f"{{{w_ns}}}sdtPr")
+            if properties is None or properties.find(f"{{{wordml_ns}}}checkbox") is None:
+                continue
+            content = content_control.find(f"{{{w_ns}}}sdtContent")
+            if content is None:
+                continue
+            # Mammoth 以复选框替换内容控件里的首个非空 Text 节点。
+            first_text = next(
+                (
+                    node
+                    for node in content.iter()
+                    if node not in ignored_nodes and node.tag in char_tags and _DocxTables._xml_table_char_fragment(node)
+                ),
+                None,
+            )
+            if first_text is not None:
+                ignored_nodes.add(first_text)
+
+        text = "".join(
+            _DocxTables._xml_table_char_fragment(node)
+            for node in xml_table.iter()
+            if node not in ignored_nodes and node.tag in char_tags
+        )
         return {
             "row_count": len(xml_table.xpath('.//*[local-name()="tr"]')),
             "cell_count": len(xml_table.xpath('.//*[local-name()="tc"]')),
@@ -205,11 +296,20 @@ class _DocxTables:
     @staticmethod
     def _html_table_signature(html_table) -> dict:
         """提取 HTML 表格的轻量签名，用于过滤 Mammoth 额外生成的表格。"""
+        text_fragments = []
+        for fragment in html_table.strings:
+            anchor = fragment.find_parent("a")
+            if anchor is not None and anchor.parent.name == "sup":
+                marker = re.fullmatch(r"(footnote|endnote)-ref-(\d+)", anchor.get("id", ""))
+                if marker and anchor.get("href") == f"#{marker.group(1)}-{marker.group(2)}":
+                    # 只忽略 Mammoth 生成的脚注引用，保留正文中的普通 [1]。
+                    continue
+            text_fragments.append(fragment.strip())
         return {
             "row_count": len(html_table.find_all("tr")),
             "cell_count": len(html_table.find_all(["td", "th"])),
             "image_count": len(html_table.find_all("img")),
-            "text": _DocxTables._normalize_table_match_text(html_table.get_text("", strip=True)),
+            "text": _DocxTables._normalize_table_match_text("".join(text_fragments)),
         }
 
     @staticmethod
@@ -369,58 +469,131 @@ class _DocxTables:
         Returns:
             str | None: 格式为 "<p>...</p>" 的 HTML 字符串；段落为空时返回 None
         """
-        items: list[str] = []
-        for token_kind, value in self._docx_formula_tokens(xml_para, source_part):
-            if token_kind == "text":
-                items.append(value)
-            else:
-                items.append(self.equation_bookends.format(EQ=value))
+        paragraph = Paragraph(xml_para, source_part.document)
 
-        if not items:
-            return None
-        return f"<p>{''.join(items)}</p>"
+        def render_node(node: Any, target: str | None = None, style: str | None = None) -> str:
+            """在链接边界内复用公式 token 与富文本规则，避免按可见标签猜测 URL。"""
+            name = self._local_name(node)
+            if name == "hyperlink":
+                rid = node.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                anchor = node.get(f"{{{_DocxConstants._BLIP_NAMESPACES['w']}}}anchor")
+                relation = source_part.rels.get(rid) if source_part is not None and rid else None
+                address = str(relation.target_ref) if relation is not None else ""
+                link = f"{address}#{anchor}" if anchor else address
+                return "".join(render_node(child, link or None, style) for child in node)
+            if name == "r" and str(node.tag) == f"{{{_DocxConstants._BLIP_NAMESPACES['w']}}}r":
+                style = formatting_to_style_str(self._get_format_from_run(Run(node, paragraph)))
+                return "".join(render_node(child, target, style) for child in node)
+            if name in {"p", "sdt", "sdtContent", "smartTag", "customXml"}:
+                return "".join(render_node(child, target, style) for child in node)
+            parts: list[str] = []
+            tokens = self._docx_formula_tokens(node, source_part)
+            for kind, value in tokens:
+                if kind == "text":
+                    markup = build_rich_text_html_from_segments([OfficeRichTextSegment(value, style, target)])
+                    parts.append(markup.replace("\n", "<br>"))
+                else:
+                    parts.append(self.equation_bookends.format(EQ=value))
+            # 公式单元格重建时也保留普通图片或安全占位图，不重复输出已恢复公式的预览。
+            if not any(kind in _DocxConstants._FORMULA_TOKEN_KINDS for kind, _value in tokens):
+                for image in self.picture_xpath_expr(node):
+                    if self._picture_is_equation_preview(image, source_part):
+                        continue
+                    image_part = self._docx_image_part(image, source_part)
+                    if image_part is None:
+                        continue
+                    source = serialize_office_image(
+                        image_part.blob,
+                        part_name=getattr(image_part, "partname", None),
+                        content_type=getattr(image_part, "content_type", None),
+                        equation_decoder=self._image_equation_decoder,
+                    )
+                    if source is not None:
+                        alt = self._docx_image_alt_text(image)
+                        parts.append(f'<img src="{escape(source, quote=True)}" alt="{escape(alt, quote=True)}">')
+            return "".join(parts)
 
-    def _handle_tables(self, element: BaseOxmlElement):
-        """
-        处理表格。
+        content = render_node(xml_para)
+        return f"<p>{content}</p>" if content else None
 
-        优先使用完整文档 mammoth 转换的预解析结果（支持列表、图片、样式等
-        复杂单元格内容），若预解析结果耗尽则回退到孤立 XML 解析模式。
+    def _close_mammoth_fallback_context(self) -> None:
+        """关闭当前文档回退解析持有的 ZIP 资源，并清除其缓存。"""
+        context = getattr(self, "_mammoth_fallback_context", None)
+        self._mammoth_fallback_context = None
+        if context is not None:
+            context[0].close()
 
-        Args:
-            element: 元素对象
-        Returns:
-            list[RefItem]: 元素引用列表
-        """
-        # 优先使用预解析表格（完整文档上下文，能正确处理列表/图片等）
-        if self._mammoth_table_idx < len(self._mammoth_tables_html):
-            html = self._mammoth_tables_html[self._mammoth_table_idx]
-            self._mammoth_table_idx += 1
-            if html is not None:
-                html = self._normalize_table_colspans(html)
-                table_block = {
-                    "type": BlockType.TABLE,
-                    "content": html,
-                }
-                self.cur_page.append(table_block)
-                return
+    def _mammoth_fallback_html(self, element: BaseOxmlElement) -> str:
+        """在原 DOCX 的样式、编号、关系和图片上下文中转换当前表格。"""
+        context = self._mammoth_fallback_context
+        if context is None:
+            file_bytes = self._fallback_docx_bytes
+            if file_bytes is None:
+                raise ValueError("DOCX fallback source is unavailable")
+            resources = ExitStack()
+            try:
+                package = resources.enter_context(open_zip(BytesIO(file_bytes), "r"))
+                paths = mammoth_docx._find_part_paths(package)
+                read_part = mammoth_docx._part_with_body_reader(None, package, paths, False)
+                embedded_style_map = read_embedded_style_map(BytesIO(file_bytes))
+                conversion_options = read_options(
+                    {"embedded_style_map": embedded_style_map, "convert_image": self._mammoth_image_converter()}
+                ).value
+                context = (resources, read_part, paths.main_document, conversion_options)
+                self._mammoth_fallback_context = context
+            except Exception:
+                resources.close()
+                raise
 
-        # 回退：孤立 XML 解析模式（原始方案，不含文档上下文）
+        _, read_part, main_part, conversion_options = context
         table = read_str(element.xml)
-        body_reader = body_xml.reader()
-        t = body_reader.read_all([table])
-        res = convert_document_element_to_html(t.value[0])
-        html = self._normalize_table_colspans(res.value)
-        html = self._inject_equations_into_table_html(
-            html,
-            element,
-            self._require_document_part(),
-        )
-        table_block = {
-            "type": BlockType.TABLE,
-            "content": html,
-        }
-        self.cur_page.append(table_block)
+
+        def read_selected_table(_root: Any, body_reader: Any) -> Any:
+            """每次获取独立 reader，只解析当前 XML 表格并沿用主文档关系。"""
+            return body_reader.read_all([table])
+
+        result = read_part(main_part, read_selected_table)
+        return convert_document_element_to_html(result.value[0], **conversion_options).value
+
+    def _handle_tables(self, element: BaseOxmlElement) -> None:
+        """按正文顺序输出表格；预匹配失败时使用完整 DOCX 上下文回退。"""
+        table_index = self._mammoth_table_idx
+        self._mammoth_table_idx += 1
+        html = self._mammoth_tables_html[table_index] if table_index < len(self._mammoth_tables_html) else None
+        stage = "full-context fallback"
+        try:
+            if html is None:
+                html = self._mammoth_fallback_html(element)
+            stage = "colspan normalization"
+            html = self._normalize_table_colspans(html)
+            if table_index >= len(self._mammoth_tables_html) or self._mammoth_tables_html[table_index] is None:
+                stage = "equation injection"
+                html = self._inject_equations_into_table_html(
+                    html,
+                    element,
+                    self._require_document_part(),
+                )
+        except Exception as exc:
+            raise RuntimeError(f"table #{table_index + 1}, {stage}: {exc}") from exc
+        self.cur_page.append({"type": BlockType.TABLE, "content": self._normalize_table_links(html)})
+
+    @staticmethod
+    def _normalize_table_links(markup: str) -> str:
+        """在 Mammoth 表格边界校验链接，非法目标保留原来的可见富文本。"""
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(markup, "html.parser")
+        changed = False
+        for link in soup.find_all("a", href=True):
+            if (
+                sanitize_hyperlink_target(
+                    link["href"], allowed_schemes=OFFICE_EXTERNAL_HYPERLINK_SCHEMES, allow_relative=True, allow_fragment=True
+                )
+                is None
+            ):
+                link.unwrap()
+                changed = True
+        return str(soup) if changed else markup
 
     def _normalize_table_colspans(self, html: str) -> str:
         """

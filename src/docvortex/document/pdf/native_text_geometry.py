@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from functools import partial
 from typing import cast
 
 import pypdfium2 as pdfium
@@ -27,85 +29,22 @@ def _restore_pdfium_surrogate_pairs(
     *,
     raw_codes: dict[int, int] | None = None,
 ) -> list[Char]:
-    """利用 PDFium 原始 UTF-16 code unit 恢复 pdftext 丢失的补充平面字符。"""
+    """准备原始 UTF-16 码元后调用共享 Rust 恢复规则，保持代表字符和来源成员。"""
+    from ..._compute_backend import get_native
+
     if not any(
         len(text := str(char.get("char", ""))) == 1 and (text == "\ufffd" or 0xD800 <= ord(text) <= 0xDFFF) for char in chars
     ):
         return chars
-
     try:
-        textpage_raw = textpage.raw
-        char_count = int(textpage.count_chars())
+        handle, count = textpage.raw, int(textpage.count_chars())
     except Exception:
-        textpage_raw = None
-        char_count = 0
-
-    restored_chars: list[Char] = []
-    consumed_char_indices: set[int] = set()
-
-    def get_unicode(handle: object, index: int) -> int:
-        """优先复用首次读取的原始码值，仅为独立辅助调用读取原生接口。"""
-        return raw_codes[index] if raw_codes is not None else int(pdfium_c.FPDFText_GetUnicode(handle, index))
-
-    for char in chars:
-        text = str(char.get("char", ""))
-        raw_char_idx = char.get("char_idx")
-        try:
-            char_idx = int(raw_char_idx) if raw_char_idx is not None else -1
-        except (TypeError, ValueError):
-            char_idx = -1
-
-        if char_idx in consumed_char_indices:
-            continue
-
-        raw_code = None
-        if (
-            textpage_raw is not None
-            and 0 <= char_idx < char_count
-            and len(text) == 1
-            and (text == "\ufffd" or 0xD800 <= ord(text) <= 0xDFFF)
-        ):
-            raw_code = int(get_unicode(textpage_raw, char_idx))
-
-        high_surrogate = None
-        low_surrogate = None
-        if raw_code is not None and 0xD800 <= raw_code <= 0xDBFF and char_idx + 1 < char_count:
-            next_code = int(get_unicode(textpage_raw, char_idx + 1))
-            if 0xDC00 <= next_code <= 0xDFFF:
-                high_surrogate = raw_code
-                low_surrogate = next_code
-                consumed_char_indices.add(char_idx + 1)
-        elif raw_code is not None and 0xDC00 <= raw_code <= 0xDFFF and char_idx > 0:
-            previous_code = int(get_unicode(textpage_raw, char_idx - 1))
-            if 0xD800 <= previous_code <= 0xDBFF:
-                high_surrogate = previous_code
-                low_surrogate = raw_code
-
-        if high_surrogate is not None and low_surrogate is not None:
-            restored_char = cast(Char, dict(char))
-            restored_char["char"] = chr(0x10000 + ((high_surrogate - 0xD800) << 10) + (low_surrogate - 0xDC00))
-            restored_char["source_indices"] = tuple(
-                sorted(
-                    set(
-                        (
-                            *char.get("source_indices", (char_idx,)),
-                            char_idx + 1 if raw_code is not None and raw_code <= 0xDBFF else char_idx - 1,
-                        )
-                    )
-                )
-            )
-            restored_chars.append(restored_char)
-            continue
-
-        if len(text) == 1 and 0xD800 <= ord(text) <= 0xDFFF:
-            restored_char = cast(Char, dict(char))
-            restored_char["char"] = "\ufffd"
-            restored_chars.append(restored_char)
-            continue
-
-        restored_chars.append(char)
-
-    return restored_chars
+        handle, count = None, 0
+    if raw_codes is None:
+        raw_codes = (
+            {index: int(pdfium_c.FPDFText_GetUnicode(handle, index)) for index in range(count)} if handle is not None else {}
+        )
+    return get_native().restore_surrogate_chars(chars, raw_codes, count)
 
 
 def _page_to_image(page: pdfium.PdfPage, scale: float, max_edge: int) -> PDFPageImage:
@@ -130,19 +69,39 @@ def _extract_page_text_geometry(
     *,
     include_extended_geometry: bool,
     visible_only: bool = False,
-) -> PDFPageTextGeometry:
+    compact: bool = False,
+    compact_only: bool = False,
+    paint_page_reader=None,
+    unicode_resolver: Callable[[pdfium.PdfTextPage, list[int]], dict[int, int]] | None = None,
+) -> PDFPageTextGeometry | None:
     """在调用方持有的页面和锁内读取字符，使批量提取与独立接口共用实现。"""
     textpage = None
     try:
-        textpage = page.get_textpage()
         raw_page_bbox: list[float] = list(page.get_bbox())
         page_rotation: int = 0
         try:
             page_rotation = page.get_rotation()
         except Exception:
             pass
-        visibility = _text_object_visibility(page, tuple(raw_page_bbox), page_rotation) if visible_only else None
+        visibility = (
+            _text_object_visibility(page, tuple(raw_page_bbox), page_rotation, paint_page_reader) if visible_only else None
+        )
+        textpage = page.get_textpage()
+        unicode_fallback = partial(unicode_resolver, textpage) if unicode_resolver is not None else None
+        if compact:
+            from .snapshot_bridge import read_text_snapshot
+
+            # 消融未显示稳定收益，恢复由 Python 包装持有 textpage 的原快照入口。
+            snapshot = read_text_snapshot(
+                textpage, raw_page_bbox, page_rotation, include_extended_geometry, visibility, unicode_fallback=unicode_fallback
+            )
+            if snapshot is not None:
+                return snapshot
+            if compact_only:
+                return None
         options = {"visibility_by_object": visibility} if visible_only else {}
+        if unicode_fallback is not None:
+            options["unicode_fallback"] = unicode_fallback
         chars = get_chars(textpage, raw_page_bbox, page_rotation, include_geometry=include_extended_geometry, **options)
         raw_codes = {char["char_idx"]: char["raw_code"] for char in chars}
         chars = _restore_pdfium_surrogate_pairs(chars, textpage, raw_codes=raw_codes)

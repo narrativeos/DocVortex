@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import statistics
+import re
 from typing import Literal
 
 from .....schema import BBox
@@ -88,7 +89,23 @@ def _classify_paragraph_titles_in_lane(
             container_bboxes,
             profile.body_height,
         )
-        if inside_visual_container or (near_visual_container and title_prototype is None):
+        independent_display_heading = (
+            not line.caption_start
+            and line_height >= 1.3 * profile.body_height
+            and line.font_signature is not None
+            and profile.body_font is not None
+            and not _font_signatures_share_family(line.font_signature, profile.body_font)
+            and abs(_bbox_center_x(bbox) - (lane.left + lane.right) / 2) <= 0.08 * lane_width
+            and bbox[2] - bbox[0] <= 0.9 * lane_width
+            and any(
+                0.5 * profile.body_height <= container[1] - bbox[3] <= 3 * profile.body_height
+                and _bbox_axis_overlap_ratio(bbox, container, axis="x") >= 0.65
+                and abs(_bbox_center_x(bbox) - _bbox_center_x(container)) <= 0.08 * (container[2] - container[0])
+                for container in container_bboxes
+            )
+        )
+        # 较大字体、独立留白及居中对齐同时成立的图前标题继续参加标题判定，普通图注保持邻图抑制。
+        if inside_visual_container or (near_visual_container and title_prototype is None and not independent_display_heading):
             continue
 
         recurrent_regular_font = _line_uses_document_regular_font(
@@ -228,6 +245,8 @@ def _classify_paragraph_titles_in_lane(
             and line_height <= 1.18 * document_body_profile.body_height
             and not weight_emphasized
         ):
+            continue
+        if not weight_emphasized and _is_full_width_sentence_body_run(rows, index, lane_width, profile):
             continue
         prototype_promotion = (
             title_prototype is not None
@@ -441,9 +460,11 @@ def _continues_local_body_row(
         for member, _member_bbox in previous_visual_row
         if member.font_signature is not None and member.font_coverage >= 0.5
     ]
+    shared_glyph_style = _mixed_script_rows_share_body_glyphs(previous_line, line)
     if (
         line.font_signature is not None
         and previous_style_members
+        and not shared_glyph_style
         and not any(
             _font_signatures_share_family(member.font_signature, line.font_signature)
             and not _font_weights_conflict(member, line)
@@ -462,11 +483,32 @@ def _continues_local_body_row(
         rows[index],
     )
     return (
-        0.8 <= line_height / previous_height <= 1.25
+        (0.8 <= line_height / previous_height <= 1.25 or shared_glyph_style)
         and previous_bbox[2] - previous_bbox[0] >= 0.75 * lane_width
         and abs(bbox[0] - previous_bbox[0]) <= 2.0 * pair_height
         and -0.25 * pair_height <= gap <= profile.regular_gap + pair_height
     )
+
+
+def _mixed_script_rows_share_body_glyphs(previous: _LineItem, current: _LineItem) -> bool:
+    """混排导致 dominant font 改变时，重复汉字字体、实际尺度和字重仍证明正文连续。"""
+    if previous.native_cjk_style and current.native_cjk_style and len(current.text) >= 25:
+        before, after = previous.native_cjk_style, current.native_cjk_style
+        return before[:3] == after[:3] and before[3] > 0 and 0.9 <= after[3] / before[3] <= 1.1
+    before = [char for char in previous.chars or [] if re.fullmatch(r"[\u4e00-\u9fff]", char.get("char", ""))]
+    after = [char for char in current.chars or [] if re.fullmatch(r"[\u4e00-\u9fff]", char.get("char", ""))]
+    if len(before) < 3 or not after or len(current.text) < 25:
+        return False
+    shared = {tuple((char.get("font") or {}).get(key) for key in ("name", "flags", "weight")) for char in before}
+    matching = [
+        char for char in after if tuple((char.get("font") or {}).get(key) for key in ("name", "flags", "weight")) in shared
+    ]
+    if not matching:
+        return False
+    heights = [char["bbox"][3] - char["bbox"][1] for char in before]
+    current_height = statistics.median(char["bbox"][3] - char["bbox"][1] for char in matching)
+    previous_height = statistics.median(heights)
+    return previous_height > 0 and 0.9 <= current_height / previous_height <= 1.1
 
 
 def _is_continuous_field_row(
@@ -499,6 +541,47 @@ def _is_continuous_field_row(
         ):
             return True
     return False
+
+
+def _is_full_width_sentence_body_run(
+    rows: list[tuple[_LineItem, BBox]],
+    index: int,
+    lane_width: float,
+    profile: _LaneBodyProfile,
+) -> bool:
+    """局部斜体多数不能使常规字体的连续长句变成标题；同字号、同栏三行自然句提供正文反证。"""
+    run = rows[index : index + 3]
+    if len(run) < 3:
+        return False
+    first, first_bbox = run[0]
+    if first.explicit_section_title or first.structural_title:
+        return False
+    from ..inline.detection import _font_styles_from_metadata
+
+    for line, bbox in run:
+        if (
+            line.semantic_type is not None
+            or not 0.85 <= _line_effective_height(line, bbox) / profile.body_height <= 1.15
+            or bbox[2] - bbox[0] < 0.8 * lane_width
+            or abs(bbox[0] - first_bbox[0]) > 0.3 * profile.body_height
+            or not _title_fonts_compatible(first, line)
+            or len(re.findall(r"\b[A-Za-z]{2,}\b", line.text)) < 6
+        ):
+            return False
+        if line.font_signature is not None and "bold" in _font_styles_from_metadata(
+            line.font_signature[0],
+            line.font_signature[1],
+            line.dominant_font_weight,
+        ):
+            return False
+    if not any(re.search(r"[,;()]", line.text) for line, _ in run[:2]):
+        return False
+    if not re.search(r"[.!?：:][\])’\"']*$", run[-1][0].text.rstrip()):
+        return False
+    return all(
+        -0.1 * profile.body_height <= _effective_text_row_gap(a, b) <= profile.regular_gap + 0.3 * profile.body_height
+        for a, b in zip(run, run[1:])
+    )
 
 
 def _is_full_width_inline_heading(

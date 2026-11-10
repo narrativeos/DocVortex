@@ -40,6 +40,16 @@ class ExactAnchorResolver:
         self._heading_labels: dict[str, str] = {}
         self._note_anchors: dict[etree._Element, str] = {}
         for spec in plan.blocks:
+            if isinstance(spec, VisualWireSpec):
+                for child in spec.children:
+                    if isinstance(child, AnnotationWireSpec):
+                        anchor = (child.element.get("data-anchor") or "").strip()
+                        identity = (child.element.get("id") or "").strip()
+                        if anchor:
+                            self._targets.setdefault(anchor, anchor)
+                            if identity:
+                                self._targets.setdefault(identity, anchor)
+                continue
             if not isinstance(spec, TextWireSpec):
                 continue
             anchor = (spec.wrapper.get("data-anchor") or "").strip()
@@ -135,12 +145,14 @@ def _materialize_visual(
     blocks: list[dict[str, object]] = []
     for child in spec.children:
         if isinstance(child, AnnotationWireSpec):
-            blocks.append(
-                {
-                    "type": child.block_type,
-                    "content": _project_inline_content(projector, child.element),
-                }
-            )
+            block = {
+                "type": child.block_type,
+                "content": _project_inline_content(projector, child.element),
+            }
+            anchor = (child.element.get("data-anchor") or "").strip()
+            if anchor:
+                block["anchor"] = anchor
+            blocks.append(block)
             continue
         block = _materialize_visual_body(child, resources, projector)
         if spec.sub_type:
@@ -170,8 +182,8 @@ def _materialize_visual_body(
             "type": BlockType.IMAGE,
             "content": _flowchart_content(spec.source_element),
         }
-        if spec.fallback_image is not None:
-            block.update(_resolve_image_payload(spec.fallback_image, resources))
+        if spec.primary_image is not None:
+            block.update(_resolve_image_payload(spec.primary_image, resources))
         return block
     if isinstance(spec, TableBodyWireSpec):
         return _materialize_table(spec, resources, projector)

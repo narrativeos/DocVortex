@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import html
+from collections import OrderedDict
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Sequence
 
 from loguru import logger
@@ -27,10 +29,43 @@ from .types import (
     PDFTextStyleLine,
     PDFTextStyleRange,
     _LineProjectionMatch,
+    _MatchedStyleRange,
     _MatchedLinkRange,
     _ProjectedChar,
     _RawLinkInterval,
+    _StyleMatchKind,
 )
+
+
+class _ContentProjectionCache:
+    """当前脚本物化调用内的只读投影缓存，按块身份及精确内容区分。"""
+
+    def __init__(self):
+        """容量同时受块数和投影字符数约束，不保留跨页面状态。"""
+        self.values = OrderedDict()
+        self.characters = 0
+
+    def project(self, block, content):
+        """特殊块或字符串沿用参考读取，普通缓存淘汰后重新计算。"""
+        if type(block) is not dict or type(content) is not str:
+            return _project_content_chars(content)
+        key = id(block)
+        cached = self.values.get(key)
+        if cached is not None:
+            if cached[0] is block and cached[1] == content:
+                self.values.move_to_end(key)
+                return cached[2]
+            self.characters -= len(cached[2])
+            del self.values[key]
+        result = _project_content_chars(content)
+        if len(result) > 8192:
+            return result
+        while self.values and (len(self.values) >= 256 or self.characters + len(result) > 8192):
+            _key, removed = self.values.popitem(last=False)
+            self.characters -= len(removed[2])
+        self.values[key] = (block, content, result)
+        self.characters += len(result)
+        return result
 
 
 def _resplit_evidence_segments(
@@ -295,6 +330,8 @@ def _assign_script_lines_to_blocks(
     blocks: list[dict[str, Any]],
     lines: Sequence[PDFTextScriptLine],
     page_size: tuple[float, float],
+    *,
+    projection_cache: _ContentProjectionCache | None = None,
 ) -> dict[int, list[PDFTextScriptLine]]:
     """保留整行主归属，并为无法投影的脚本区间补充 tight bbox 备用归属。"""
 
@@ -306,7 +343,12 @@ def _assign_script_lines_to_blocks(
         and (block_bbox := _block_bbox_to_page_bbox(block.get("bbox"), page_size)) is not None
     }
     target_projected = {
-        block_index: _project_content_chars(str(blocks[block_index]["content"])) for block_index in target_bboxes
+        block_index: (
+            projection_cache.project(blocks[block_index], str(blocks[block_index]["content"]))
+            if projection_cache is not None
+            else _project_content_chars(str(blocks[block_index]["content"]))
+        )
+        for block_index in target_bboxes
     }
     primary_assignments = _assign_lines_to_blocks(blocks, lines, page_size)
     assignments: dict[int, list[PDFTextScriptLine]] = {
@@ -410,36 +452,22 @@ def _filter_line_styles_for_block(
     return output
 
 
-def _project_content_chars(content: str) -> list[_ProjectedChar]:
-    """把原始文字投影为忽略空白和圆括号公式的可比较字符。"""
+_PROJECT_CONTENT_RECORD_NEW = _ProjectedChar.__new__
 
-    projected: list[_ProjectedChar] = []
-    pending_formula_gap = False
-    cursor = 0
-    while cursor < len(content):
-        if content.startswith(r"\(", cursor):
-            formula_end = content.find(r"\)", cursor + 2)
-            if formula_end >= 0:
-                cursor = formula_end + 2
-                pending_formula_gap = True
-                continue
-        raw_char = content[cursor]
-        fragment = _normalize_match_fragment(raw_char)
-        for fragment_index, value in enumerate(fragment):
-            projected.append(
-                _ProjectedChar(
-                    value=value,
-                    raw_start=cursor,
-                    raw_end=cursor + 1,
-                    existing_styles=frozenset(),
-                    formula_gap_before=pending_formula_gap and fragment_index == 0,
-                    inside_hyperlink=False,
-                )
-            )
-        if fragment:
-            pending_formula_gap = False
-        cursor += 1
-    return projected
+
+def _project_content_chars(content: str) -> list[_ProjectedChar]:
+    """将原始文字交给原生投影器，保留 Python 文本规范化和对象类型。"""
+    from ....._compute_backend import get_native
+
+    result = get_native().project_content_chars_owned(
+        content,
+        _normalize_match_fragment,
+        _ProjectedChar,
+        _PROJECT_CONTENT_RECORD_NEW,
+    )
+    if result is None:
+        raise ValueError("native content projection rejected normalized text")
+    return result
 
 
 def _all_occurrences(content: str, target: str, start: int) -> list[int]:
@@ -545,48 +573,78 @@ def _match_line_across_formula_gaps(
     return None
 
 
+def _append_style_match(
+    output: list[PDFTextStyleRange],
+    matches: list[_MatchedStyleRange] | None,
+    line: PDFTextStyleLine,
+    source_range: PDFTextStyleRange,
+    start: int,
+    end: int,
+    kind: _StyleMatchKind,
+) -> None:
+    """追加兼容的样式区间，并按需保留尚未合并的匹配来源。"""
+    output.append(PDFTextStyleRange(start, end, source_range.styles))
+    if matches is not None:
+        matches.append(_MatchedStyleRange(line, source_range, start, end, kind))
+
+
 def _ranges_from_line_projection(
     line: PDFTextStyleLine,
     match: _LineProjectionMatch,
+    *,
+    matches: list[_MatchedStyleRange] | None = None,
+    kind: _StyleMatchKind = "formula",
 ) -> list[PDFTextStyleRange]:
     """把物理行样式区间投影为公式字符被跳过后的 block 文本区间。"""
 
     output: list[PDFTextStyleRange] = []
     for style_range in line.style_ranges:
         current_start: int | None = None
+        source_start = style_range.start
         previous_index: int | None = None
-        for projected_index in match.source_to_projected[style_range.start : style_range.end]:
+        source_end = style_range.start
+        for source_index, projected_index in enumerate(
+            match.source_to_projected[style_range.start : style_range.end], start=style_range.start
+        ):
             if projected_index is None:
                 if current_start is not None and previous_index is not None:
-                    output.append(
-                        PDFTextStyleRange(
-                            current_start,
-                            previous_index + 1,
-                            style_range.styles,
-                        )
+                    _append_style_match(
+                        output,
+                        matches,
+                        line,
+                        PDFTextStyleRange(source_start, source_index, style_range.styles),
+                        current_start,
+                        previous_index + 1,
+                        kind,
                     )
                 current_start = None
                 previous_index = None
                 continue
             if current_start is not None and previous_index is not None and projected_index != previous_index + 1:
-                output.append(
-                    PDFTextStyleRange(
-                        current_start,
-                        previous_index + 1,
-                        style_range.styles,
-                    )
+                _append_style_match(
+                    output,
+                    matches,
+                    line,
+                    PDFTextStyleRange(source_start, source_index, style_range.styles),
+                    current_start,
+                    previous_index + 1,
+                    kind,
                 )
                 current_start = None
             if current_start is None:
                 current_start = projected_index
+                source_start = source_index
             previous_index = projected_index
+            source_end = source_index + 1
         if current_start is not None and previous_index is not None:
-            output.append(
-                PDFTextStyleRange(
-                    current_start,
-                    previous_index + 1,
-                    style_range.styles,
-                )
+            _append_style_match(
+                output,
+                matches,
+                line,
+                PDFTextStyleRange(source_start, source_end, style_range.styles),
+                current_start,
+                previous_index + 1,
+                kind,
             )
     return output
 
@@ -641,6 +699,8 @@ def _match_line_without_terminal_hyphen(
 def _match_style_ranges(
     projected: Sequence[_ProjectedChar],
     lines: Sequence[PDFTextStyleLine],
+    *,
+    matches: list[_MatchedStyleRange] | None = None,
 ) -> list[PDFTextStyleRange]:
     """按物理行顺序把字体与装饰线证据确定性对齐到 block 文本。"""
 
@@ -651,14 +711,16 @@ def _match_style_ranges(
         next_line = lines[line_index + 1] if line_index + 1 < len(lines) else None
         line_start = projected_text.find(line.text, cursor)
         if line_start >= 0:
-            output.extend(
-                PDFTextStyleRange(
+            for style_range in line.style_ranges:
+                _append_style_match(
+                    output,
+                    matches,
+                    line,
+                    style_range,
                     line_start + style_range.start,
                     line_start + style_range.end,
-                    style_range.styles,
+                    "exact",
                 )
-                for style_range in line.style_ranges
-            )
             cursor = line_start + len(line.text)
             continue
         formula_match = _match_line_across_formula_gaps(
@@ -667,7 +729,7 @@ def _match_style_ranges(
             cursor,
         )
         if formula_match is not None:
-            output.extend(_ranges_from_line_projection(line, formula_match))
+            output.extend(_ranges_from_line_projection(line, formula_match, matches=matches))
             cursor = formula_match.end
             continue
         dehyphenated_match = _match_line_without_terminal_hyphen(
@@ -677,7 +739,7 @@ def _match_style_ranges(
             cursor,
         )
         if dehyphenated_match is not None:
-            output.extend(_ranges_from_line_projection(line, dehyphenated_match))
+            output.extend(_ranges_from_line_projection(line, dehyphenated_match, matches=matches, kind="dehyphenated"))
             cursor = dehyphenated_match.end
             continue
         skipped_ranges: list[PDFTextStyleRange] = []
@@ -691,12 +753,14 @@ def _match_style_ranges(
             if position is None:
                 skipped_ranges.append(style_range)
                 continue
-            output.append(
-                PDFTextStyleRange(
-                    position,
-                    position + style_range.end - style_range.start,
-                    style_range.styles,
-                )
+            _append_style_match(
+                output,
+                matches,
+                line,
+                style_range,
+                position,
+                position + style_range.end - style_range.start,
+                "fragment",
             )
             cursor = position + style_range.end - style_range.start
         if skipped_ranges:
@@ -718,29 +782,38 @@ def _match_style_ranges(
 def _match_script_line_ranges(
     projected: Sequence[_ProjectedChar],
     line: PDFTextStyleLine,
+    *,
+    matches: list[_MatchedStyleRange] | None = None,
+    next_line: PDFTextStyleLine | None = None,
 ) -> list[PDFTextStyleRange]:
     """独立投影单条脚本行，避免其它视觉行推进 cursor 后吞掉短脚本。"""
 
     projected_text = "".join(token.value for token in projected)
+    output: list[PDFTextStyleRange] = []
     exact_occurrences = _all_occurrences(projected_text, line.text, 0)
     if len(exact_occurrences) == 1:
         line_start = exact_occurrences[0]
-        return [
-            PDFTextStyleRange(
+        for style_range in line.style_ranges:
+            _append_style_match(
+                output,
+                matches,
+                line,
+                style_range,
                 line_start + style_range.start,
                 line_start + style_range.end,
-                style_range.styles,
+                "exact",
             )
-            for style_range in line.style_ranges
-        ]
+        return output
     formula_match = _match_line_across_formula_gaps(
         line.text,
         projected,
         0,
     )
     if formula_match is not None:
-        return _ranges_from_line_projection(line, formula_match)
-    output: list[PDFTextStyleRange] = []
+        return _ranges_from_line_projection(line, formula_match, matches=matches)
+    dehyphenated_match = _match_line_without_terminal_hyphen(projected_text, line, next_line, 0)
+    if dehyphenated_match is not None:
+        return _ranges_from_line_projection(line, dehyphenated_match, matches=matches, kind="dehyphenated")
     for style_range in line.style_ranges:
         position = _resolve_fallback_occurrence(
             projected_text,
@@ -750,12 +823,14 @@ def _match_script_line_ranges(
         )
         if position is None:
             continue
-        output.append(
-            PDFTextStyleRange(
-                position,
-                position + style_range.end - style_range.start,
-                style_range.styles,
-            )
+        _append_style_match(
+            output,
+            matches,
+            line,
+            style_range,
+            position,
+            position + style_range.end - style_range.start,
+            "fragment",
         )
     return _merge_style_ranges(output)
 
@@ -800,6 +875,83 @@ def _merge_style_ranges(ranges: Sequence[PDFTextStyleRange]) -> list[PDFTextStyl
             active_counts[style] = active_counts.get(style, 0) + delta
         previous_position = position
     return merged
+
+
+def _resolve_script_matches(matches: Sequence[_MatchedStyleRange]) -> list[_MatchedStyleRange]:
+    """逐最小区间优先采用整行证据，同级上下标冲突时弃权，并保留胜出来源。"""
+    # 同一源区间经顺序和独立路径命中时只保留最强的一份，重复命中不参与投票。
+    unique: dict[tuple[Any, ...], _MatchedStyleRange] = {}
+    for match in matches:
+        if match.start >= match.end:
+            continue
+        key = (
+            match.line.source_index,
+            tuple(match.line.bbox),
+            match.line.text,
+            match.source_range,
+            match.start,
+            match.end,
+        )
+        previous = unique.get(key)
+        if previous is None or (previous.kind == "fragment" and match.kind != "fragment"):
+            unique[key] = match
+    candidates = list(unique.values())
+    events: dict[int, list[tuple[int, bool]]] = {}
+    for index, match in enumerate(candidates):
+        events.setdefault(match.start, []).append((index, True))
+        events.setdefault(match.end, []).append((index, False))
+    active: set[int] = set()
+    retained: dict[int, list[tuple[int, int]]] = {}
+    previous_position: int | None = None
+    for position in sorted(events):
+        if previous_position is not None and previous_position < position and active:
+            strongest = {index for index in active if candidates[index].kind != "fragment"} or active
+            styles = {
+                style
+                for index in strongest
+                for style in candidates[index].source_range.styles
+                if style in {"superscript", "subscript"}
+            }
+            if len(styles) == 1:
+                for index in strongest:
+                    segments = retained.setdefault(index, [])
+                    if segments and segments[-1][1] == previous_position:
+                        segments[-1] = (segments[-1][0], position)
+                    else:
+                        segments.append((previous_position, position))
+        for index, entering in events[position]:
+            if entering:
+                active.add(index)
+            else:
+                active.discard(index)
+        previous_position = position
+    output: list[_MatchedStyleRange] = []
+    for index, segments in retained.items():
+        match = candidates[index]
+        for start, end in segments:
+            source_start = match.source_range.start + start - match.start
+            output.append(
+                replace(
+                    match,
+                    start=start,
+                    end=end,
+                    source_range=PDFTextStyleRange(source_start, source_start + end - start, match.source_range.styles),
+                )
+            )
+    return sorted(
+        output,
+        key=lambda item: (
+            item.start,
+            item.end,
+            item.line.source_index,
+            item.line.bbox,
+            item.line.text,
+            item.source_range.start,
+            item.source_range.end,
+            item.source_range.styles,
+            item.kind,
+        ),
+    )
 
 
 def _resolve_link_fallback_occurrence(
@@ -1171,6 +1323,7 @@ __all__ = [
     "_match_line_without_terminal_hyphen",
     "_match_style_ranges",
     "_match_script_line_ranges",
+    "_resolve_script_matches",
     "_merge_style_ranges",
     "_resolve_link_fallback_occurrence",
     "_project_link_range_from_line_match",

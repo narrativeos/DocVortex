@@ -1,9 +1,12 @@
 """PPTX 图片、图表与公式资源，复用当前转换器的单文档状态。"""
 
 from typing import Any, Optional
+from pptx.oxml.text import CT_TextLineBreak
+from ..rich_text import OfficeRichTextSegment, build_rich_text_html_from_segments
 from loguru import logger
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from ..ooxml_chart import extract_chart_html_from_ooxml
+from .....errors import ResourceLimitError
 from ..image import serialize_office_image
 from ..equation.ooxml import is_mathtype_equation_prog_id
 from .....schema import BlockType
@@ -79,6 +82,36 @@ class _PptxResources:
                 equations.append(latex)
         return equations
 
+    def _table_paragraph_html(self, paragraph: Any, shape: Any) -> str:
+        """按 XML 顺序恢复表格中的样式、换行、公式与对应 run 的链接。"""
+        runs = {id(run._r): run for run in paragraph.runs}
+        font_sources = self._get_paragraph_font_sources(shape, paragraph)
+        parts: list[str] = []
+        for node in paragraph._element.content_children:
+            if isinstance(node, CT_TextLineBreak):
+                parts.append("<br>")
+            elif self._is_math_content_node(node):
+                latex = self._convert_math_node_to_latex(node)
+                if latex:
+                    parts.append(f"<eq>{latex}</eq>")
+            else:
+                text = getattr(node, "text", None)
+                if not text:
+                    continue
+                run = runs.get(id(node))
+                parts.append(
+                    build_rich_text_html_from_segments(
+                        [
+                            OfficeRichTextSegment(
+                                text,
+                                self._get_style_str_from_run(run, font_sources) if run is not None else None,
+                                self._resolve_hyperlink_from_run(run, shape) if run is not None else None,
+                            )
+                        ]
+                    )
+                )
+        return "".join(parts)
+
     def _handle_tables(self, shape):
         """将PowerPoint表格转换为HTML格式。
 
@@ -146,9 +179,9 @@ class _PptxResources:
                 attr_str = " " + " ".join(attrs) if attrs else ""
 
                 # 获取单元格文本内容
-                cell_text = cell.text.strip() if cell.text else ""
-                # 转义HTML特殊字符，防止XSS
-                cell_text = cell_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                cell_text = "<br>".join(
+                    self._table_paragraph_html(paragraph, shape) for paragraph in cell.text_frame.paragraphs
+                ).strip()
 
                 html_parts.append(f"    <{tag}{attr_str}>{cell_text}</{tag}>")
 
@@ -185,6 +218,8 @@ class _PptxResources:
 
         try:
             chart_html = extract_chart_html_from_ooxml(chart_xml, workbook_bytes)
+        except ResourceLimitError:
+            raise
         except Exception as e:
             logger.warning(f"Warning: chart HTML cannot be extracted: {e}")
             return
@@ -207,10 +242,10 @@ class _PptxResources:
 
         image_bytes, content_type = image_data
 
-        latex = self._image_equation_decoder.decode(
+        latex = self._image_equation_decoder.probe(
             image_bytes,
             content_type=content_type,
-        )
+        ).latex
         if latex:
             self.cur_page.append(
                 {
@@ -221,34 +256,56 @@ class _PptxResources:
             return
 
         if content_type == "image/svg+xml":
-            img_base64 = serialize_office_image(image_bytes, content_type=content_type)
+            img_base64 = serialize_office_image(
+                image_bytes, equation_decoder=self._image_equation_decoder, content_type=content_type
+            )
             if img_base64 is None:
                 # SVG 光栅化失败时回退到 PowerPoint 为 SVG 原生伴随存储的栅量 blip。
                 fallback_data = self._get_shape_image_data(shape, include_svg=False)
                 if fallback_data is not None and fallback_data[1] != "image/svg+xml":
-                    img_base64 = serialize_office_image(fallback_data[0], content_type=fallback_data[1])
+                    img_base64 = serialize_office_image(
+                        fallback_data[0], equation_decoder=self._image_equation_decoder, content_type=fallback_data[1]
+                    )
             if img_base64 is not None:
-                self.cur_page.append(
-                    {
-                        "type": BlockType.IMAGE,
-                        "image_base64": img_base64,
-                    }
-                )
+                self.cur_page.append(self._build_image_block(img_base64, shape))
             return
 
         img_base64 = serialize_office_image(
             image_bytes,
+            equation_decoder=self._image_equation_decoder,
             content_type=content_type,
         )
         if img_base64 is None:
             return
 
+        self.cur_page.append(self._build_image_block(img_base64, shape))
+
+    def _build_image_block(self, img_base64: str, shape) -> dict:
+        """构造图片块，形状 cNvPr 的 descr（替代文本）作为识别内容输出。"""
         image_block = {
             "type": BlockType.IMAGE,
             "image_base64": img_base64,
         }
-        self.cur_page.append(image_block)
-        return
+        alt_text = self._pptx_shape_alt_text(shape)
+        if alt_text:
+            image_block["content"] = alt_text
+        return image_block
+
+    @staticmethod
+    def _pptx_shape_alt_text(shape) -> str:
+        """读取形状非可视属性 cNvPr 上的 descr 替代文本，兼容各形状包装元素。"""
+        element = getattr(shape, "_element", None)
+        if element is None:
+            element = getattr(shape, "element", None)
+        if element is None:
+            return ""
+        for candidate in element.iter():
+            tag = str(candidate.tag)
+            if tag.endswith("}cNvPr") or tag == "cNvPr":
+                descr = (candidate.get("descr") or "").strip()
+                if descr:
+                    return descr
+        return ""
 
     def _decode_pptx_shape_image_equation(self, shape: Any) -> str | None:
         """从普通 picture 或 OLE preview 的 WMF/GIF comment 恢复公式。"""
@@ -257,10 +314,10 @@ class _PptxResources:
         if image_data is None:
             return None
         image_bytes, content_type = image_data
-        return self._image_equation_decoder.decode(
+        return self._image_equation_decoder.probe(
             image_bytes,
             content_type=content_type,
-        )
+        ).latex
 
     @staticmethod
     def _find_first_embedded_image_rid(shape, *, include_svg: bool = True) -> Optional[str]:

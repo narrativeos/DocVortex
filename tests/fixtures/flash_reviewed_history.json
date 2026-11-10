@@ -39,8 +39,8 @@
         },
         {
           "page_index": 1,
-          "fingerprint": "fa22e09c4e7765589ebf0ee263915c60f18d2f971d6c969d4365eb33c5d9edb1",
-          "bbox_fingerprint": "207f3d438a0be03cdee47728a92cc1cd5b1f05847e831b86dfa2aa49e26d134a"
+          "fingerprint": "e1b3fb48746666b94af7995b186ef7a980a2e84b0a5253ba594e379cb650e2d1",
+          "bbox_fingerprint": "a980fe08afb7d1cd51f10fd90427346dbe6e45d43ae7bc5378cee6b3856069d5"
         },
         {
           "page_index": 2,
@@ -124,13 +124,13 @@
         },
         {
           "page_index": 18,
-          "fingerprint": "34f0c4b9f918971fcc44f72339d24d8c66ba72942619981f4c92fe71ff484863",
-          "bbox_fingerprint": "c4fb92f66beaded040b3a014696d9dd5b75f8a83cb8b1a26bb0c9d3df3834833"
+          "fingerprint": "40d6ac43e7e8e58519ccf50f01cd0222bef1224af021ad2cbe19266b43daeb6c",
+          "bbox_fingerprint": "7873f75c9b3daeca18d58a4d2d61e7009c0f3d155aeb15bcf763f5f61bb4ed1e"
         },
         {
           "page_index": 19,
-          "fingerprint": "80f1eaaa92b6bcb97503b925375b57233ab7ab18bb99f24844145a7b3f53a449",
-          "bbox_fingerprint": "ef82bcd85e74af91eacf39299dd816d89dab0708ba2f84fbae3bd4507c3db6eb"
+          "fingerprint": "62b6e28fd2f49f0b6caee4454065f71c782185a711275d943c59afb9d359f9a5",
+          "bbox_fingerprint": "09cde0fdf7325991c3a3c92b8fce16cf076d887cab6984aa0ded1fa419a2c974"
         },
         {
           "page_index": 20,
@@ -171,8 +171,8 @@
         },
         {
           "page_index": 4,
-          "fingerprint": "9628364973945ac7ffbceb9094aa09b9d25a0c88783b814637291bce20122ea6",
-          "bbox_fingerprint": "2f52c50b71aa97c63efc144b8760ae9841b1b97b522f121dc366198d8e006300"
+          "fingerprint": "f26b024a6aa935744eeea7183b57c84071fe0840e1249b7f4df8f296e65a5812",
+          "bbox_fingerprint": "2e531fc973f92309861a5fe905d3cb0833bd7c2596fd2335b03f05440ca53bb7"
         },
         {
           "page_index": 5,
@@ -223,8 +223,8 @@
       "pages": [
         {
           "page_index": 0,
-          "fingerprint": "7acd5e327408854773beddb7ad93b6e3c775792ec4f75c51a04a000a5e9a9b18",
-          "bbox_fingerprint": "b45d538513a66a87cfb0467e3c1d7ed6701d28c100eda4f30d9e589e3535177c"
+          "fingerprint": "ec3e60d2433492c362003212610f8f13ee4272433202257c1986060b8ab4d4b7",
+          "bbox_fingerprint": "1ae3eebb8cc9ef551c7d930df1d459c6e7a82c05f7ccc727ae4f90a5f91e6efb"
         },
         {
           "page_index": 1,
@@ -541,8 +541,8 @@
         },
         {
           "page_index": 2,
-          "fingerprint": "8c8189740b17018a9839f3a8944a8e130c7eb36ced3c9a5eef0d080d9dd84b52",
-          "bbox_fingerprint": "be69bb403aecbf22f1f219ccb293d3923509b90b868a234a388967da5af0892e"
+          "fingerprint": "d6f5489eb253023dcbcb07fba008b2b0eb0467a31b760ca914455a4527c01e48",
+          "bbox_fingerprint": "4cf3857783a7515c88d0045ecb53040ceba8fc6310d0083049d73fb69131f68c"
         },
         {
           "page_index": 3,
@@ -551,8 +551,8 @@
         },
         {
           "page_index": 4,
-          "fingerprint": "1fda4ad3d4e335660f9c69e5cf463d27c30162a1192dc2f6291958c69775484d",
-          "bbox_fingerprint": "0b138cb777fc302b11a8a7aa751f87b0ebf9935a39fa4498ae864f594daf513c"
+          "fingerprint": "fb2769a3139458b68d9b5bdfbbeff542ef6723d59def9d677913714abd9637c8",
+          "bbox_fingerprint": "19ec8507ea7f2f8110f8daccd47d87394effb0e5ef297b5395fe7c496894f392"
         },
         {
           "page_index": 5,
@@ -610,8 +610,8 @@
         },
         {
           "page_index": 2,
-          "fingerprint": "223f8dc3618805a8688095824d638d00348540403923ffddb74ba95a3a1961df",
-          "bbox_fingerprint": "c83743f89e12f6984bd9eb20f37303a668c8df982be11f86c9ae4851e035aafe"
+          "fingerprint": "e6fb79e7152afcaf55356d423580b8208c4efe1bd7b95f565ceb42948ca4c67b",
+          "bbox_fingerprint": "36611d06fab0d9b2d098e897091573f5f49da5c0c370970ab206f00b3377d1dc"
         },
         {
           "page_index": 3,
@@ -627,18 +627,18 @@
       "pages": [
         {
           "page_index": 0,
-          "fingerprint": "e8c7373da4ff33552d4680a87332f779d61f14ca2ce8ccad418dd19f6d434178",
-          "bbox_fingerprint": "70b6df5ee386b8a09fd7264d1ded0d9db6ec28bc62225997b0ccebdbb92d1ffb"
+          "fingerprint": "377d7c873ce183fa9884dd0cac71f058a75246306037b317064bfa698b96855f",
+          "bbox_fingerprint": "a3e71405551e26c7a5ba790d897be0fc2cb9635259c2c44923cb8a177bf1c770"
         },
         {
           "page_index": 1,
-          "fingerprint": "de41614800af2744ac923df98b75258195676ea84a8859dac60d20c742a40d6c",
-          "bbox_fingerprint": "ef440221392995c6a72a649e69032604b48a486fc14671b825eb008b3c6314f8"
+          "fingerprint": "c56d4f67d789500f03c74cead6c61bae1d51a8535801ac86d4bbd8d1dcc52c0b",
+          "bbox_fingerprint": "438f39734502b843c032d46758b574bfac6b487f9a6de83cb8f6572055ddb109"
         },
         {
           "page_index": 2,
-          "fingerprint": "3afb4db2a243c0fa76fa5edcb1b1f13d61bd25521fb605c0e2f66f6198c05d7b",
-          "bbox_fingerprint": "284601fdd56888d397e3d94b853fe5c1c17b9715b4873aff711e01f579633602"
+          "fingerprint": "a9e6f4dc59b21a913f11c6f719aa089b1293675ce7ae94a3df76c0175425f591",
+          "bbox_fingerprint": "398a030256331e1c3bebd58658d366d2dd7ae02e77897734f960a0af41c12351"
         },
         {
           "page_index": 3,
@@ -647,8 +647,8 @@
         },
         {
           "page_index": 4,
-          "fingerprint": "091efd6e9e6896ec41919411dbad18f03632926cd62abc04d3b99414c4f00e7f",
-          "bbox_fingerprint": "05b1ddb3524caca2b5e408ff8af9acb8f36581e895ced841e073d9856f478036"
+          "fingerprint": "f72c046d6cca75b5627b0e3be2a933078fe44fca354ccd22c47a357de61b3e49",
+          "bbox_fingerprint": "e615f4f8caa77b835a851e3e7e1d75cd326b8799e81b2e946f5e3311ef2c94f3"
         }
       ]
     },
@@ -681,12 +681,12 @@
         },
         {
           "page_index": 1,
-          "fingerprint": "3e3705c60b6ee7542b58631adf5f50a0a93ad94a3d841bb3c71cc2a4e51e7cf1",
-          "bbox_fingerprint": "b1a399bc249a3714db6b816188f33a78f5e8d9ece7dcc8157f0bd03f9e74b577"
+          "fingerprint": "2c9da89377f2a81c338add5087f24c7a214ca4550a6db5e02b8d66371928bd8e",
+          "bbox_fingerprint": "77c62980ec86f09d4116d5e76c734c65dbb965f5a4661af382752a178671c81b"
         },
         {
           "page_index": 2,
-          "fingerprint": "995e10ce974ade1042fafa8d1d5c686e9d792c8a63da9ee73913f2f4b8865432",
+          "fingerprint": "7893d7fe4f057cf7a5c21cc914046b36fa7140f24cbd7e4b8c725be772052524",
           "bbox_fingerprint": "6aa7e44ad613ebcdf2fb80b339d85bdf713733730f650f1de9d58896c3d577e3"
         },
         {
@@ -696,13 +696,13 @@
         },
         {
           "page_index": 4,
-          "fingerprint": "ee5fa5b6311e65b4c30e668dab6f41b0acaff6a3e01c48aa17355037e136103c",
-          "bbox_fingerprint": "04a002521778c5ef296d5a3468c8c1c111cc54dcbac2457ee3f6a23f11c735ab"
+          "fingerprint": "94a49b0df227de4adff979f4895a2b9ef403be43eaa03a9be87a3263b8fa15d3",
+          "bbox_fingerprint": "4cf456fc74fda8488601b4f37966126a489b7e8558a54517f832ae1834ecc51c"
         },
         {
           "page_index": 5,
-          "fingerprint": "abee9b87128e89537f59454f078156f7981d9b35405b07ce7b5039cdb1c4f1a4",
-          "bbox_fingerprint": "1b3887124eca5f098165bcde0ead0c84c99f6d68821d0640164e5f585c2aa9fe"
+          "fingerprint": "86ceac5deb0f2faa51f89937c10de11da875e146f704ac59d33c58b73c34204d",
+          "bbox_fingerprint": "38f8887d126c0429f7c14ca0c3e071067b900cc00c197062b789309e669cef4e"
         },
         {
           "page_index": 6,
@@ -716,8 +716,8 @@
         },
         {
           "page_index": 8,
-          "fingerprint": "bd2c489e665e33ef2be2698a6b2bb1a817ddb16684c472f18e34012222b85860",
-          "bbox_fingerprint": "43606b72732bb29ccf312bf71309022a826b33017d48b4650f7a0dcaf56598b0"
+          "fingerprint": "cbe0fb5a9e660e953526f17808c6dd4f6d5f63a349620c67fdd4705ff4279b15",
+          "bbox_fingerprint": "e68f5836dbbae230a38787b743b0525bdb4002ad02e193dce55f1b4dc81268c1"
         },
         {
           "page_index": 9,
@@ -776,8 +776,8 @@
         },
         {
           "page_index": 20,
-          "fingerprint": "4dba454eee528d58a5f597daa5d1de4d233c0a3fa83ebe6a62b627c082a88a87",
-          "bbox_fingerprint": "3225e4fc8a43bee2bc653316c7bcdc2ae20ba9a1ac3c28fad6bacecd86cac26b"
+          "fingerprint": "ec7dda7a7fd4f113015f00f3286e6e2a346ce941493174d410e440655d6ddc44",
+          "bbox_fingerprint": "d2a8e7d65fd2b877b012c1f5b91e14816ffe81ff14e433cf5b0747d6fe1df9ad"
         },
         {
           "page_index": 21,
@@ -803,8 +803,8 @@
       "pages": [
         {
           "page_index": 0,
-          "fingerprint": "29c6ee99392dc49b632c3bd813817d09eeb3dbb9ef87edb513612b2c0e08a91b",
-          "bbox_fingerprint": "e03fd27a178ae2df253a985491834a688dd95e8c3c709480b7b2033045a8a2ab"
+          "fingerprint": "baf8194901c64ccb81abab9c81e63f187ed38c7775e17ff47b9d76b43bfff17c",
+          "bbox_fingerprint": "e13964c3d9b10b91cf9ba1f9850a8ba2ef8a6ffac7b793552d59fe9821828dd3"
         },
         {
           "page_index": 1,
@@ -843,8 +843,8 @@
         },
         {
           "page_index": 8,
-          "fingerprint": "71e1cbdb4ada5c94684e49dacb15e56e138aeb8f578be2424b8c6e868c6d1d78",
-          "bbox_fingerprint": "8369e4b0f4e791e35784b7c80e99bf3a8c1a0c3da6241c32ab7a5dc1731f10e2"
+          "fingerprint": "be309250df5765ff22eeaffaf7e19796e58ad9b9c6306269d8c14195343d0961",
+          "bbox_fingerprint": "cb129570b3a501cf1af3f680bfb769d58d28a539615584226ffa0c3ddaef3e5a"
         },
         {
           "page_index": 9,
@@ -860,118 +860,118 @@
       "pages": [
         {
           "page_index": 0,
-          "fingerprint": "4ab591e6f98e7aeed9a031dce73116dbb81b40576d8ee727bb6eee2a53c60e3e",
-          "bbox_fingerprint": "1972f73feacc0a66d0be233369ef26683d464405d5ad9d69e743e385adf3d750"
+          "fingerprint": "1da42be2d3cebfec44ed3ea1ad9be662fb7373bd6886d5e07cb00937a3d21f5d",
+          "bbox_fingerprint": "725faec30b895396f9037c105b1e2d1d8b61f6bbc36103804c407e94e66cd991"
         },
         {
           "page_index": 1,
-          "fingerprint": "f47fa30a125f5a4c46dd9a27c659d5f7a7e2d26c05943467a650e71f1c1ced84",
-          "bbox_fingerprint": "07764765969fc1103c48999f88449e6b64c4db15b62f9450e5c06e08ab2dad65"
+          "fingerprint": "777a952c6041e058ac210c0102473ed150c3902239cb4803dc16cc52504ad18f",
+          "bbox_fingerprint": "0ca93c4a7fa157c5b4c79ce9f0ac6463697e44a871c87851a77ba43a05f3b48e"
         },
         {
           "page_index": 2,
-          "fingerprint": "927a2a5119363aba1e4240cf22ab8f479ac51cf5f8ee9d412fc524940bb8b49f",
-          "bbox_fingerprint": "f219f69097fe284e033e05014866d50b043b42d48a8d136710fbc61fb50f0ab3"
+          "fingerprint": "64783aa58c8d5ddd88ad8571e630748110de8cb04266954f135ed965bd3c4f58",
+          "bbox_fingerprint": "f0032c0a93851911b1f75c1845a48ce7f1697dcb79d49bf6cbe3eedf776be48b"
         },
         {
           "page_index": 3,
-          "fingerprint": "e8e9be5e955890ab6f0fa4bbefc4908c1c8d1b86bf6a28a796dc64d95a5b694b",
-          "bbox_fingerprint": "be65951bf7d647152afcd179516659ca5fda25bc7d869a20abf42991d7d0f8d1"
+          "fingerprint": "9d6fa42b80414310a503efde9565103029ca83abc8b7e1a257a8a08d3b58bfd5",
+          "bbox_fingerprint": "89df37dd33b7ba5d61ed8cc4a562c9db945d05c35e748e8edbfe475057c2e123"
         },
         {
           "page_index": 4,
-          "fingerprint": "f6e035e0b608d17cee4f95032c2d6a3378deaf55943ea09da21c25ba878856aa",
-          "bbox_fingerprint": "59610ff0f4820cd1130c1322052a3f3df81d67cd3dcb67de0699ae7354e247ca"
+          "fingerprint": "c28d59fe38b52801d5eb143b638bb623537aec59bd2ce0eefc099ffbb0a6beb2",
+          "bbox_fingerprint": "f1ac5a56568fd72c94b6148d2d5389fb1568ca1d6bb610e0b3d2d265f75afeac"
         },
         {
           "page_index": 5,
-          "fingerprint": "ff4beb43e91d85677515f865d926c7ef9ca9acba0a7d23f03e44bfc7463fbfdd",
-          "bbox_fingerprint": "0369e57d324cffe2c3292d3edf7ec199105c0f286431b162d9ac48f34a52b599"
+          "fingerprint": "107923aefcc841782768085c845f339ebcd7df587fa828315f0cf3b8fe3c1b11",
+          "bbox_fingerprint": "4f045f4e6a16502a8864f9fd57820bcaa3047fb2f89277716162639450a7ae36"
         },
         {
           "page_index": 6,
-          "fingerprint": "e5625fbff8dda5468116443423657ca22b91691a8798e231ecadd0d28cf22771",
-          "bbox_fingerprint": "97e36c6f5cc149c61163384bfbe7ed89216af97ad2fe5c08247b12644786fd35"
+          "fingerprint": "e94dc2d6da2fe518423b588837788111a4a3441d541391bb40943e3e2fc845b8",
+          "bbox_fingerprint": "db0e8cd1108b2116c2489626e0a7e2a535257a5f42342bbe66d5751312cbbfbf"
         },
         {
           "page_index": 7,
-          "fingerprint": "caaf491189bc67c90260327cbf8d92e66cf4dfbdb3511876c1cbbb86ab39ef77",
-          "bbox_fingerprint": "6695850c11b46b63867b49e05b9baee537be5050d1109a2ea8ee09850099828e"
+          "fingerprint": "bcbadda280a0f48ddb11d836c2ca6f2e9b52d576f3b93d216022f922597f1b1d",
+          "bbox_fingerprint": "b8aea15f659e79cd05c6d08909e4bf31c28ef718b6954627aba6f8ad8b0c1cff"
         },
         {
           "page_index": 8,
-          "fingerprint": "0bf08fc3f2cd3e33b5175b7e127864c3c1ae06b0ac0674b6abde891e3402db12",
-          "bbox_fingerprint": "cf9664bf2f5a50bb775a615a71beee9759a487787012586b2ee9832ef7c3bb38"
+          "fingerprint": "f2c94efa6bb8cfd7cc2d5a4656bab7f343e64ce0032bd58a2e2511b13278c32a",
+          "bbox_fingerprint": "76d0088b3516bfeb8a4e874c80dcf65e31bf9c3bf21a410e71bd2adcdae8c963"
         },
         {
           "page_index": 9,
-          "fingerprint": "b3b98abe8634815d2d7148977045d98371ee69b268afcbc02e4d67e2604e66d8",
-          "bbox_fingerprint": "069c3dd11dc4efa4ad60cb1323ff8734261e046ccd558fd2f93f325f4acaab3e"
+          "fingerprint": "b2846d3f344878ed34c6cc39197553c83bf9856d940e5bd67a057de079927f40",
+          "bbox_fingerprint": "d5117d8bdfd24b84e29c6439290b2fbf269c3f7d6abaf3b395ef5d0f4158838d"
         },
         {
           "page_index": 10,
-          "fingerprint": "935b162f71ee530f402abef9d185812948d05a253b9ccb3a66aeeddccce7e4a4",
-          "bbox_fingerprint": "ff1a4cd22352ea89a32ddb281924fff2a7355e34d35c29b14afef5b75b27ee04"
+          "fingerprint": "1a9bdbb10662d0a9885e939c5ab542abd0a7a487a6ab3bd09b015a7d487f4c00",
+          "bbox_fingerprint": "2fa8a7f3dcda663721783ce6dee77271918afec59a989cd0cf52ef9d91c8b65a"
         },
         {
           "page_index": 11,
-          "fingerprint": "e976b65fa39cd441c319c2d952afa6fd3cce908b5b47230bc4114f5b56c870e0",
-          "bbox_fingerprint": "f0b94963d3376bf2dbe3a268078c028315f7693f1b7b0017be6c61189ece5358"
+          "fingerprint": "bb986584a656623e8c713126ab17bc893080c6b1de34794f3fc9ebdc5876efb4",
+          "bbox_fingerprint": "2584f134794ce31da3573a127cc881627e335c580bd4f7fb8ae4aa8fc1c198b8"
         },
         {
           "page_index": 12,
-          "fingerprint": "62e6044cc7ef3d44625111b250962dbc6c79f99ccf1f55756dbdcbe2bb0ebf5a",
-          "bbox_fingerprint": "62d0d387be02dc42c0900a716ad93979ff19d5c9b099c6ab69cd7aa6be1256a9"
+          "fingerprint": "0775fadea449edd417ffef9491b0b46ae52f26ae7ff1fe78980e5c242fc94017",
+          "bbox_fingerprint": "ff862a441b1bdfa5cce0111fbbedc3d61c82691513775974ddde9f65e02db899"
         },
         {
           "page_index": 13,
-          "fingerprint": "7a9bcba4f94aecc86bedb0441fcce0c6114d63923dd591bc84880552450873c2",
-          "bbox_fingerprint": "4504bf26154dbe3b4a158740491e0386cfba7913fb0427d27726499e89f98e84"
+          "fingerprint": "ea53b4ccc6fff25e997862e1408bce78e4fb56ab6d539a0da80a299803ef4a85",
+          "bbox_fingerprint": "b2b2480ddede7e108e7dae67e3f370eb9c475fe67408fb734c8417d074c2e84a"
         },
         {
           "page_index": 14,
-          "fingerprint": "8bf0a3dd1e4ddcdc7ee7ff066cc52792b48bb3c4e72d284ea423a58a6b945414",
-          "bbox_fingerprint": "d84797b6b68bc979fe1ceb96f9932cea4dcf2bec90748f6bf584ffa07f148790"
+          "fingerprint": "51b083ef3747c67540cb48278914397b031ab4df893602bf7cc9e4c52a18d8a4",
+          "bbox_fingerprint": "fdfb5be17fd46bef134b9998315c9e234bf1066c5cd0dfeaf3683708cc96afe1"
         },
         {
           "page_index": 15,
-          "fingerprint": "168ec82b72b08bf6b6ff8595fe49b727f8322cadce6481c014e6a757f3c445a9",
-          "bbox_fingerprint": "d7883fa88b9b05c13658d7f1ae1377a9d4c8f7f85c7a4769b052460e5c13bfcd"
+          "fingerprint": "d0ce0fa01bfd107aea9c3cde30d9b8ae4c81c494af5c9fc4d8e852d1410e14b4",
+          "bbox_fingerprint": "ecdbd10aadc0492a19c5a294094aee70ca0123318456a4a425dd0918a735b870"
         },
         {
           "page_index": 16,
-          "fingerprint": "338443fa0e15930f44c82292463bf43c6ed910cbb62f90061b0488d7fe687796",
-          "bbox_fingerprint": "50bd44f92b18713e46e7115c7fe4af25bed4f5cb5574faf707ecb224399fc92a"
+          "fingerprint": "f632d12f91dc334cc0abd3aefe85342f6641a4ba7eadd8847b7266c2e597986d",
+          "bbox_fingerprint": "b95c59b718977820f94e3ce5d6ec403deb102a3c4981720b7fae08d4b697a5f3"
         },
         {
           "page_index": 17,
-          "fingerprint": "4da99528c7e852cbe743c2a8a411528ca150a9ede3bbe6d33b7a4926b662b40f",
-          "bbox_fingerprint": "a096a86eb90467b2480c78deaf440e365d10ad567b5fcfe3a984a9e78d67c66c"
+          "fingerprint": "7f85738f60a342a92236b4831cf14a29cacc928f7eb59c69b08db924d905d857",
+          "bbox_fingerprint": "45fb79a5d0c14aa15d748dd147030cd1462705bd7bcab9723b2f61b5e8222a32"
         },
         {
           "page_index": 18,
-          "fingerprint": "f3f6bab5ee7f89c2f68672a0c98458d03a0e46492a29052638bd86df01185183",
-          "bbox_fingerprint": "f4b980c3e993bbbe956d919d32333c320a926bb577b19ce6e9e372f1cce2f5bc"
+          "fingerprint": "893237f12b9f2b653abaed5e407b349c7006ee26171278bb02673130e7f9fcd7",
+          "bbox_fingerprint": "4d8ec482d520e889ad597322facb32bd22553a1b8f20d3c4256e92b954607152"
         },
         {
           "page_index": 19,
-          "fingerprint": "51882f9de7307ec46b4c6b1973576597212bbb2a46cf6e1485bc9bda41bc3bfc",
-          "bbox_fingerprint": "1ddc7adf023afd19b5ecbd027007d86f0659f8ee2385f3e851d743ef18792b19"
+          "fingerprint": "6cce657df8454093b1a9a82b766d72da65a3796ade2a02902fde27a2e7d0b997",
+          "bbox_fingerprint": "b6e5659c5efac0eedce442f69bb70a45a693592e4b82ac1aab7b0e27db9bc06f"
         },
         {
           "page_index": 20,
-          "fingerprint": "7d630de66940ff88dd01c0f5577428fa6e0621696e2a4ece9f4bede31d67069a",
-          "bbox_fingerprint": "2145a7dec42e774d07576cf0d0f6c77aeb952168d3945c302f2d5168c64aa2fe"
+          "fingerprint": "92ac234f4c28e0826ae32bfe5f00e16422f0aef594e1cdd57cba8a26e9f672b3",
+          "bbox_fingerprint": "74c0c0d13d575d462f63751e8c23e7bd90dc2a6863a1c10d10b2e93ea72a8ece"
         },
         {
           "page_index": 21,
-          "fingerprint": "84abdfef05b02f2a799a6ec52317c315835178048247c8928e811717410baf60",
-          "bbox_fingerprint": "ae97997c3874cf338d95da48b7d1c179d1a27d994a4a6861c340010fdf0232e1"
+          "fingerprint": "fa1a6324e5c6e5e38cdcfda8011a9ea7f431ec6c734f400fe95750981eef107f",
+          "bbox_fingerprint": "a9aa6c49daa310ecce50d577046027795b2302c974810e699dc966ea6c32da5d"
         },
         {
           "page_index": 22,
-          "fingerprint": "ca605f18b24fe71c39b75b71a03eae4d00eb22239a7a22389e612aa1c25c2931",
-          "bbox_fingerprint": "50795bc4508ba1a21a8f787111473da31128d771090f2bd2ba65b4339ff0ad44"
+          "fingerprint": "2411987d60b0a1cfd7459dff73b5eed2fcdb6622ec5f8749a359e31d94bba8d7",
+          "bbox_fingerprint": "590bc5f380b8f9debe25abd43f03e83f0f3dc04874c6c0895cfe4b03defef160"
         }
       ]
     },
@@ -1511,8 +1511,8 @@
       "pages": [
         {
           "page_index": 0,
-          "fingerprint": "691868af009d91fbdc4d43127d66717d83f64405f551a4c7896ba7d704926558",
-          "bbox_fingerprint": "3069613cb30d68415e6f685c0e94f32bde89397e91835d4244f281454ff1f4b6"
+          "fingerprint": "87c9633a175605fb183a8f5429a24d5e6177f8b4942e6876f910c572ca933159",
+          "bbox_fingerprint": "71aba18389ad9882470e4864dc51b14899db95bbd4aaf9c9542c0dd72808f29b"
         },
         {
           "page_index": 1,
@@ -1538,32 +1538,33 @@
       "pages": [
         {
           "page_index": 0,
-          "fingerprint": "2f21bc49743de625d8be40a53c414ff2a0aabc4a87d4ec256417cc259fb1247f",
-          "bbox_fingerprint": "c253ba68ddcd512ddd80f9b38ece94648038887f11f32bdd3db7c084dd5ee253"
+          "fingerprint": "4fa9566a49d5915ad53100d777b0c3aecd537d6a71c60e7477c135f9082e1768",
+          "bbox_fingerprint": "a6ea6eebee6ca16d16f762fc3eb90b9818d22a14429f1e947f919e293224d79a"
         },
         {
           "page_index": 1,
-          "fingerprint": "6458eb642b1871697154a66b65b6250425fa747bb1ea25dca15a719c5859a6cb",
-          "bbox_fingerprint": "297181f5f44331170de718382feffa8feec6d0acf49f059bbf5d7637dc244d4d"
+          "fingerprint": "842e2044504acdb8f2fefdc7079e69363d3d4bc372e669abae5397cd534881dd",
+          "bbox_fingerprint": "a2a49308454dc0f616879b6b7d67fc50d8a28952c5f048fd77a4594454bfe7f8"
         },
         {
           "page_index": 2,
-          "fingerprint": "ceb9ca3a2a1222c2d22552dcd3a508e24e79a23b9f8c284b96a8b95c2096bc28",
-          "bbox_fingerprint": "60b63443037dde9fee35f5290fbbcc371250290dc83b16c58af95a2c31291cd5"
+          "fingerprint": "97e967ef49c07f0cd790274a4abadc42d239253e7e5f6bcc3d3b84916720d768",
+          "bbox_fingerprint": "3dc9276953b1b05cbe11f618d95eb39f39297926677a2cf03e12241d773fc6e5"
         },
         {
           "page_index": 3,
-          "fingerprint": "cc4cfcadf562e56c9b326f243daac480dd178391872eed37cbcef4e047192777",
-          "bbox_fingerprint": "e6e30a111410323ca0dc3add1ef3b83e31bc2976033d650dc67785bbfc1bcd7a"
+          "fingerprint": "c5c15e0e6b59ae76d705c69d92431901938e2793bfa84b81ca12eeab16182e76",
+          "bbox_fingerprint": "ba1ca6fa2fa113c6818155b1374544473ffdd603d0920e65e0967b6e883d84a1"
         },
         {
           "page_index": 4,
-          "fingerprint": "0c61c6b4193888c26754fdfad68c3276f12859b3ee22a9ca46d3d64d137a9a70",
-          "bbox_fingerprint": "b690e1d0373f11f58d441073cf69369473b0d8f242246c4142506b95e5fe2d18"
+          "fingerprint": "6e9c55bc9e187232b6487d3ba7d21659410a233bf648e48dcf0e8afabbcecfcc",
+          "bbox_fingerprint": "0b3b5f3571d7a257e625301365b402e420d08d6d524a135332df16e69ccd5e6c"
         }
       ]
     }
   ],
   "round2_review_record": "docs/flash-round2-annotations-2026-09-15.md",
-  "bbox_tolerance_policy": "未配置坐标容差为零；容差按 0.001 输出网格的整数刻度差冻结，取诊断矩阵最大实测值"
+  "bbox_tolerance_policy": "未配置坐标容差为零；容差按 0.001 输出网格的整数刻度差冻结，取诊断矩阵最大实测值",
+  "release_review_record": "tests/fixtures/flash_release_0_5_16_decisions.json"
 }

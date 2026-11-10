@@ -3,15 +3,16 @@ import hashlib
 import posixpath
 import re
 import xml.etree.ElementTree as ET
-import zipfile
 from io import BytesIO
-from typing import BinaryIO, cast
+from typing import Any, BinaryIO, cast
 
 from loguru import logger
 from openpyxl import load_workbook
+from openpyxl.cell.cell import Cell
 from openpyxl.drawing.image import Image as XlsImage
 from openpyxl.utils.cell import range_to_tuple
 from openpyxl.worksheet.worksheet import Worksheet
+from PIL import Image
 from ..image import serialize_office_image
 from ..equation.image import OfficeImageEquationDecoder
 from ..equation.ooxml import OoxmlEquationDecoder
@@ -23,6 +24,7 @@ from ..spreadsheet.html import EQUATION_BOOKENDS, render_spreadsheet_table
 from ..spreadsheet.models import AnchoredBlock, FormulaMap, SheetImage
 from ..spreadsheet.projector import SpreadsheetProjector
 from .package_normalizer import normalize_xlsx_package, strip_xlsx_ole_objects_for_openpyxl
+from .resource_budget import validate_xlsx_merge_budget
 from .ooxml_ole import (
     XlsxOleEquationArtifact,
     package_has_sheet_ole_objects,
@@ -31,6 +33,8 @@ from .ooxml_ole import (
     workbook_sheet_parts,
 )
 from .....schema import BlockType
+from .....errors import DocumentError
+from .....foundation.ooxml_zip import OoxmlZipFile
 
 
 class XlsxConverter(SpreadsheetProjector):
@@ -55,6 +59,7 @@ class XlsxConverter(SpreadsheetProjector):
         self._suppressed_ole_previews: set[tuple[tuple[int, int], str]] = set()
         self._ooxml_equation_decoder = OoxmlEquationDecoder()
         self._image_equation_decoder = OfficeImageEquationDecoder()
+        self._reset_conversion_caches()
 
     def convert(
         self,
@@ -64,6 +69,8 @@ class XlsxConverter(SpreadsheetProjector):
             try:
                 self._convert_package_stream(file_stream)
                 return
+            except (DocumentError, LegacyOfficeResourceLimitError, MemoryError):
+                raise
             except Exception as exc:
                 file_bytes = read_stream_bytes_from_start(file_stream)
                 self._retry_convert_package_bytes_after_normalization(file_bytes, exc)
@@ -72,6 +79,8 @@ class XlsxConverter(SpreadsheetProjector):
         file_bytes = file_stream.read()
         try:
             self._convert_package_bytes(file_bytes)
+        except (DocumentError, LegacyOfficeResourceLimitError, MemoryError):
+            raise
         except Exception as exc:
             self._retry_convert_package_bytes_after_normalization(file_bytes, exc)
 
@@ -90,6 +99,24 @@ class XlsxConverter(SpreadsheetProjector):
         self._suppressed_ole_previews = set()
         self._ooxml_equation_decoder = OoxmlEquationDecoder()
         self._image_equation_decoder = OfficeImageEquationDecoder()
+        self._reset_conversion_caches()
+
+    def _reset_conversion_caches(self) -> None:
+        """释放只在当前 XLSX 只读投影期间有效的样式和成功媒体结果。"""
+        self._projection_cache_enabled = False
+        self._cell_style_cache: dict[tuple[int, ...], dict[str, Any]] = {}
+        self._resolved_cell_image_cache: dict[str, str] = {}
+
+    def _extract_cell_style(self, cell: Any) -> dict[str, Any]:
+        """在当前工作簿投影期间复用相同样式值，并为每格返回独立字典。"""
+        if not self._projection_cache_enabled or type(cell) is not Cell or cell.parent.parent is not self.workbook:
+            return super()._extract_cell_style(cell)
+        style_key = tuple(cell._style) if cell._style is not None else ()
+        style = self._cell_style_cache.get(style_key)
+        if style is None:
+            style = super()._extract_cell_style(cell)
+            self._cell_style_cache[style_key] = style
+        return dict(style)
 
     def _convert_package_bytes(self, file_bytes: bytes) -> None:
         """用独立字节流解析 XLSX 包，便于原始包失败后用规范化包重试。"""
@@ -98,14 +125,16 @@ class XlsxConverter(SpreadsheetProjector):
     def _convert_package_stream(self, file_stream: BinaryIO) -> None:
         """直接使用可复位的 XLSX 流解析正常路径，避免提前复制完整包字节。"""
         self._reset_state()
+        self._projection_cache_enabled = True
         try:
-            self.zf = zipfile.ZipFile(file_stream)
-            self._sheet_part_by_title = workbook_sheet_parts(self.zf)
-        except Exception as e:
-            logger.warning(f"Failed to open zip file: {e}")
-            self.zf = None
-
-        try:
+            self.zf = OoxmlZipFile(file_stream)
+            validate_xlsx_merge_budget(self.zf)
+            try:
+                self._sheet_part_by_title = workbook_sheet_parts(self.zf)
+            except (DocumentError, LegacyOfficeResourceLimitError, MemoryError):
+                raise
+            except Exception as exc:
+                logger.warning(f"Failed to map XLSX worksheet resources: {exc}")
             workbook_stream: BinaryIO = file_stream
             if self.zf is not None and package_has_sheet_ole_objects(
                 self.zf,
@@ -113,6 +142,9 @@ class XlsxConverter(SpreadsheetProjector):
             ):
                 file_bytes = read_stream_bytes_from_start(file_stream)
                 workbook_stream = BytesIO(strip_xlsx_ole_objects_for_openpyxl(file_bytes))
+                with OoxmlZipFile(workbook_stream) as normalized_archive:
+                    validate_xlsx_merge_budget(normalized_archive)
+                rewind_stream(workbook_stream)
             else:
                 rewind_stream(file_stream)
             self.workbook = load_workbook(
@@ -134,6 +166,7 @@ class XlsxConverter(SpreadsheetProjector):
             else:
                 logger.error("工作簿未初始化。")
         finally:
+            self._reset_conversion_caches()
             if self.zf:
                 self.zf.close()
                 self.zf = None
@@ -306,20 +339,38 @@ class XlsxConverter(SpreadsheetProjector):
         self,
         image: XlsImage,
     ) -> tuple[bytes, str | None, str | None] | None:
-        """优先从原 ZIP 读取 openpyxl 图片的未转码原始字节。"""
+        """有界读取 openpyxl 保留的原始流，避免把写出路径误当源 part。"""
 
-        part_name = str(getattr(image, "path", "") or "") or None
-        payload = self._read_xlsx_image_member(part_name) if part_name is not None else None
+        payload = None
+        source = getattr(image, "ref", None)
+        if all(callable(getattr(source, method, None)) for method in ("read", "tell", "seek")):
+            try:
+                position = source.tell()
+                try:
+                    source.seek(0)
+                    payload = source.read(MAX_ENTRY_BYTES + 1)
+                finally:
+                    source.seek(position)
+            except (LegacyOfficeResourceLimitError, MemoryError):
+                raise
+            except (AttributeError, OSError, TypeError, ValueError):
+                payload = None
         if payload is None:
             try:
                 payload = image._data()  # type: ignore[attr-defined]
+            except (LegacyOfficeResourceLimitError, MemoryError):
+                raise
             except Exception:
                 return None
-            if len(payload) > MAX_ENTRY_BYTES:
-                raise LegacyOfficeResourceLimitError(f"XLSX image exceeds max_entry_bytes={MAX_ENTRY_BYTES}")
-        image_format = str(getattr(image, "format", "") or "").casefold()
-        content_type = f"image/{image_format}" if image_format else None
-        return payload, part_name, content_type
+        if len(payload) > MAX_ENTRY_BYTES:
+            raise LegacyOfficeResourceLimitError(f"XLSX image exceeds max_entry_bytes={MAX_ENTRY_BYTES}")
+        # _data() 可能把 BMP/TIFF 转成 PNG，媒体类型必须来自返回的字节。
+        try:
+            with Image.open(BytesIO(payload)) as decoded:
+                content_type = Image.MIME.get(decoded.format)
+        except (OSError, ValueError):
+            content_type = None
+        return payload, None, content_type
 
     def _collect_sheet_images(self, sheet: Worksheet) -> list[SheetImage]:
         """读取当前工作表的原始图片并识别图片公式。"""
@@ -340,12 +391,13 @@ class XlsxConverter(SpreadsheetProjector):
                 if key in seen:
                     continue
                 seen.add(key)
-                latex = self._image_equation_decoder.decode(
+                latex = self._image_equation_decoder.probe(
                     artifact.payload,
                     part_name=artifact.part_name,
-                )
+                ).latex
                 image_base64 = serialize_office_image(
                     artifact.payload,
+                    equation_decoder=self._image_equation_decoder,
                     part_name=artifact.part_name,
                     content_type=None,
                 )
@@ -375,13 +427,14 @@ class XlsxConverter(SpreadsheetProjector):
                 if key in seen:
                     continue
                 seen.add(key)
-                latex = self._image_equation_decoder.decode(
+                latex = self._image_equation_decoder.probe(
                     payload,
                     part_name=part_name,
                     content_type=content_type,
-                )
+                ).latex
                 image_base64 = serialize_office_image(
                     payload,
+                    equation_decoder=self._image_equation_decoder,
                     part_name=part_name,
                     content_type=content_type,
                 )
@@ -395,6 +448,8 @@ class XlsxConverter(SpreadsheetProjector):
                         order=image_order,
                     )
                 )
+            except (LegacyOfficeResourceLimitError, MemoryError):
+                raise
             except Exception as e:
                 logger.error(f"无法从 Excel 工作表中提取图片，错误信息：{e}")
 
@@ -627,25 +682,53 @@ class XlsxConverter(SpreadsheetProjector):
             logger.warning(f"图片目标文件不存在，image_id={image_id}, target={zip_target_path}")
             return ""
 
+        if self._projection_cache_enabled and zip_target_path in self._resolved_cell_image_cache:
+            return self._resolved_cell_image_cache[zip_target_path]
+
         try:
             image_payload = self._read_xlsx_image_member(zip_target_path)
             if image_payload is None:
                 return ""
-            latex = self._image_equation_decoder.decode(
+            latex = self._image_equation_decoder.probe(
                 image_payload,
                 part_name=zip_target_path,
-            )
+            ).latex
             if latex:
-                return EQUATION_BOOKENDS.format(EQ=latex)
+                result = EQUATION_BOOKENDS.format(EQ=latex)
+                if self._projection_cache_enabled:
+                    self._resolved_cell_image_cache[zip_target_path] = result
+                return result
             img_base64 = serialize_office_image(
                 image_payload,
+                equation_decoder=self._image_equation_decoder,
                 part_name=zip_target_path,
                 content_type=None,
             )
-            return rf'<img src="{img_base64}" />' if img_base64 is not None else ""
+            result = rf'<img src="{img_base64}" />' if img_base64 is not None else ""
+            if result and self._projection_cache_enabled and self._is_cacheable_cell_bitmap(image_payload, zip_target_path):
+                self._resolved_cell_image_cache[zip_target_path] = result
+            return result
         except Exception as e:
             logger.warning(f"读取单元格图片失败，image_id={image_id}, target={zip_target_path}, error={e}")
             return ""
+
+    @staticmethod
+    def _is_cacheable_cell_bitmap(image_payload: bytes, part_name: str) -> bool:
+        """仅复用常见位图的成功序列化，保留矢量降级及部分渲染的逐次诊断。"""
+        if posixpath.splitext(part_name)[1].casefold() not in {
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".bmp",
+            ".tif",
+            ".tiff",
+            ".webp",
+        }:
+            return False
+        return image_payload.startswith(
+            (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"BM", b"II*\x00", b"MM\x00*")
+        ) or (image_payload.startswith(b"RIFF") and image_payload[8:12] == b"WEBP")
 
     def _load_cell_image_mappings(self):
         if self.cell_image_map:

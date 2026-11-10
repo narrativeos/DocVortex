@@ -192,6 +192,18 @@
           },
           "title": "Content",
           "type": "array"
+        },
+        "anchor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Anchor"
         }
       },
       "required": [
@@ -506,6 +518,18 @@
           },
           "title": "Content",
           "type": "array"
+        },
+        "anchor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Anchor"
         }
       },
       "required": [
@@ -861,6 +885,7 @@
             "tsv",
             "epub",
             "html",
+            "mhtml",
             "ofd",
             "odt",
             "ods",
@@ -1329,6 +1354,18 @@
           },
           "title": "Content",
           "type": "array"
+        },
+        "anchor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Anchor"
         }
       },
       "required": [
@@ -2412,6 +2449,18 @@
           },
           "title": "Content",
           "type": "array"
+        },
+        "anchor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Anchor"
         }
       },
       "required": [

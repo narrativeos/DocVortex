@@ -1,0 +1,137 @@
+name: Native wheels
+
+# 仅由 Publish 工作流在发布时（workflow_call）或手动触发运行；
+# push/PR 的 Rust 构建与测试已由 ci.yml 覆盖，不再重复跑轮子矩阵。
+on:
+  workflow_dispatch:
+    inputs:
+      skip_ci:
+        description: 'Build distributions without Rust checks or wheel tests'
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      skip_ci:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# 测试样本可能包含中文文件名；Windows 重定向日志也必须使用 UTF-8。
+env:
+  PYTHONUTF8: '1'
+
+concurrency:
+  group: native-wheels-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-24.04, arch: x86_64, name: linux-x86_64, deployment: '', smoke: '3.14', build: 'cp311-*'}
+          - {os: ubuntu-24.04-arm, arch: aarch64, name: linux-aarch64, deployment: '', smoke: '3.14', build: 'cp311-*'}
+          - {os: windows-latest, arch: AMD64, name: windows-x86_64, deployment: '', smoke: '3.14', build: 'cp311-*'}
+          - {os: windows-11-arm, arch: ARM64, name: windows-arm64, deployment: '', smoke: '3.14', build: 'cp311-*'}
+          - {os: macos-15, arch: arm64, name: macos-arm64, deployment: '14.0', smoke: '3.14', build: 'cp311-*'}
+          # ONNX Runtime 1.24.4 起没有 Intel macOS wheel，0.6.0 不再发布该平台产物。
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      # GitHub 字符串比较不区分大小写，须按 runner 限定 Windows ARM64，避免误匹配 macOS arm64。
+      - uses: actions/setup-python@v6
+        if: matrix.os == 'windows-11-arm'
+        id: python-arm64
+        with:
+          python-version: '3.14'
+          architecture: arm64
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ steps.python-arm64.outputs.python-path || '3.14' }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.98.1'
+      - name: Configure MSVC for ARM64 dependency builds
+        if: matrix.os == 'windows-11-arm'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64_arm64
+      - name: Build and test ABI3 wheel on the platform's minimum Python
+        env:
+          CIBW_BUILD: ${{ matrix.build }}
+          CIBW_SKIP: '*-musllinux_*'
+          CIBW_ARCHS: ${{ matrix.arch }}
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
+          CIBW_BEFORE_ALL_LINUX: export CARGO_HOME=/opt/docvortex-cargo RUSTUP_HOME=/opt/docvortex-rustup; curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.1
+          CIBW_ENVIRONMENT_LINUX: 'PATH="/opt/docvortex-cargo/bin:$PATH" CARGO_HOME=/opt/docvortex-cargo RUSTUP_HOME=/opt/docvortex-rustup'
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment }}
+          CIBW_TEST_REQUIRES: pytest psutil pypdfium2==5.13.0
+          CIBW_TEST_SKIP: ${{ inputs.skip_ci && '*' || '' }}
+          CIBW_TEST_COMMAND: python {project}/tools/verify_native_wheel.py {project}/demo/pdfs/demo1.pdf && python -m pytest {project}/tests/test_native_parity.py {project}/tests/test_rule_graphics_acceleration.py {project}/tests/test_rule_text_acceleration.py {project}/tests/test_rule_pixel_form_acceleration.py {project}/tests/test_rule_layout_batch_acceleration.py {project}/tests/test_rule_numeric_graphics_acceleration.py {project}/tests/test_rule_fill_bands_acceleration.py {project}/tests/test_native_statistics.py {project}/tests/test_native_round3.py {project}/tests/test_native_round4.py {project}/tests/test_native_round5.py {project}/tests/test_native_round6.py {project}/tests/test_native_round7.py {project}/tests/test_pdfium_bridge.py {project}/tests/test_pdf_object_bridge.py {project}/tests/test_pdf_classify_page_loading.py {project}/tests/test_pdf_classify_resource_graph.py {project}/tests/test_pdf_drawing_lines_extraction.py {project}/tests/test_pdf_native_graphics_components.py {project}/tests/unittest/test_flash_pdf_auxiliary_text.py {project}/tests/test_pdf_snapshot.py {project}/tests/test_native_inline_styles.py {project}/tests/test_native_bitmap_crops.py {project}/tests/test_pdf_render_session.py {project}/tests/test_native_font_runtime.py {project}/tests/test_native_text_pipeline.py {project}/tests/test_native_text_snapshot.py {project}/tests/test_native_classification.py {project}/tests/test_native_image_text_classification.py {project}/tests/unittest/test_pdf_classify_image_text.py {project}/tests/unittest/test_flash_pdf_char_geometry.py {project}/tests/test_native_table_candidates.py {project}/tests/test_native_candidate_boundaries.py {project}/tests/test_native_annotation_geometry.py {project}/tests/unittest/test_native_pdf_table_demo_manifest.py {project}/tests/test_pdf_analysis_api.py {project}/tests/test_pdf_cpu_evidence.py -q && python {project}/tools/verify_native_wheel.py {project}/demo/pdfs/demo2.pdf && python {project}/tools/verify_nonpdf_wheel.py --output {project}/build/nonpdf-cp311 --run-tests
+        run: uvx --from "cibuildwheel>=3.1,<4" cibuildwheel --output-dir wheelhouse
+      - name: Verify binary ABI on Python 3.14 without optional application dependencies
+        if: ${{ !inputs.skip_ci }}
+        run: uv run --no-project --python "${{ steps.python-arm64.outputs.python-path || '3.14' }}" python tools/verify_native_abi.py wheelhouse
+      - name: Install the exact built artifact on the current supported dependency stack
+        if: ${{ !inputs.skip_ci }}
+        run: |
+          uv venv --seed --python "${{ steps.python-arm64.outputs.python-path || matrix.smoke }}"
+          uv run --no-project --python "${{ steps.python-arm64.outputs.python-path || matrix.smoke }}" python -c "import pathlib, subprocess, sys; wheels=list(pathlib.Path('wheelhouse').glob('*.whl')); assert len(wheels)==1, wheels; subprocess.check_call([sys.executable, '-m', 'pip', 'install', str(wheels[0]), 'pytest', 'psutil', 'pypdfium2==5.13.0'])"
+      - name: Verify installed wheel and real parsing
+        if: ${{ !inputs.skip_ci }}
+        run: uv run --no-project --python "${{ steps.python-arm64.outputs.python-path || matrix.smoke }}" python tools/verify_native_wheel.py demo/pdfs/demo2.pdf
+      - name: Verify non-PDF installed wheel and bounded regressions
+        if: ${{ !inputs.skip_ci }}
+        run: uv run --no-project --python "${{ steps.python-arm64.outputs.python-path || matrix.smoke }}" python tools/verify_nonpdf_wheel.py --output build/nonpdf-current --run-tests
+      - uses: actions/upload-artifact@v6
+        if: ${{ always() && !inputs.skip_ci }}
+        with:
+          name: nonpdf-release-${{ matrix.name }}
+          path: |
+            build/nonpdf-cp311/
+            build/nonpdf-current/
+          retention-days: 14
+      - name: Verify Windows ARM64 native installation and reportlab fallback
+        if: ${{ matrix.os == 'windows-11-arm' && !inputs.skip_ci }}
+        # 复用当前 wheel 的安装环境，不再另建 Python 3.11/3.14 安装矩阵。
+        run: |
+          uv run --no-project --python "${{ steps.python-arm64.outputs.python-path }}" python -m pip check
+          uv run --no-project --python "${{ steps.python-arm64.outputs.python-path }}" python tools/verify_windows_arm64_install.py
+      - name: Verify generated dense table with the installed wheel
+        if: ${{ !inputs.skip_ci }}
+        run: |
+          uv run --no-project --python "${{ steps.python-arm64.outputs.python-path || matrix.smoke }}" python tools/generate_dense_pdf.py dense-table.pdf
+          uv run --no-project --python "${{ steps.python-arm64.outputs.python-path || matrix.smoke }}" python tools/verify_native_wheel.py dense-table.pdf --expectation dense-table
+          uv run --no-project --python "${{ steps.python-arm64.outputs.python-path || matrix.smoke }}" python -m pytest tests/test_native_inline_styles.py tests/test_native_bitmap_crops.py tests/test_pdfium_bridge.py tests/test_pdf_object_bridge.py tests/test_pdf_classify_page_loading.py tests/test_pdf_classify_resource_graph.py tests/test_pdf_drawing_lines_extraction.py tests/test_pdf_native_graphics_components.py tests/unittest/test_flash_pdf_auxiliary_text.py tests/test_pdf_snapshot.py tests/test_pdf_render_session.py tests/test_native_font_runtime.py tests/test_native_text_pipeline.py tests/test_native_text_snapshot.py tests/test_native_classification.py tests/test_native_image_text_classification.py tests/unittest/test_pdf_classify_image_text.py tests/unittest/test_flash_pdf_char_geometry.py tests/test_native_table_candidates.py tests/test_native_candidate_boundaries.py tests/test_native_annotation_geometry.py tests/test_native_round3.py tests/test_native_round4.py tests/test_native_round5.py tests/test_native_round6.py tests/test_native_round7.py -q
+      - name: Verify Windows ARM64 PDF export regressions
+        if: ${{ matrix.os == 'windows-11-arm' && !inputs.skip_ci }}
+        # PDFium 桥接和会话测试已由上一共享步骤覆盖，此处只补原独立任务的额外回归。
+        run: >-
+          uv run --no-project --python "${{ steps.python-arm64.outputs.python-path }}" python -m pytest
+          tests/test_native_parity.py
+          tests/unittest/test_pdf_render.py tests/unittest/test_pdf_render_diagnostics.py
+          tests/test_complete_pipeline.py tests/test_public_pipeline.py tests/test_system_font_pdf_pipeline.py
+          tests/test_pdf_render_pool.py -q
+      # 性能对比仅在本机执行；平台矩阵保留构建、ABI、安装和正确性检查。
+      - uses: actions/upload-artifact@v6
+        with:
+          name: dist-${{ matrix.name }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  rust-checks:
+    if: ${{ !inputs.skip_ci }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.98.1'
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test -p docvortex-core --locked

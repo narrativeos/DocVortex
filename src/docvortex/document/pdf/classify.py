@@ -13,6 +13,7 @@ from pypdf import PdfReader
 from pypdf.generic import ContentStream
 
 from .pdfium import PdfiumFontError, close_pdfium_child, pdfium_guard
+from .classification_bridge import NativeClassificationError
 
 MAX_SAMPLE_PAGES = 10
 CHARS_THRESHOLD = 50
@@ -213,10 +214,11 @@ def classify(pdf_doc: pdfium.PdfDocument, pdf_bytes: bytes) -> str:
                 )
                 return "ocr"
 
-            if get_high_image_coverage_ratio_pdfium(pdf_doc, page_indices) >= HIGH_IMAGE_COVERAGE_THRESHOLD:
+            # 背景大图不能否决正常正文；只将多数正文依赖图片、附加文字不实际绘制的页面判为扫描件。
+            if any(sample.get("image_backed_ocr", False) for sample in text_samples):
                 return "ocr"
 
-    except PdfiumFontError:
+    except (PdfiumFontError, NativeClassificationError):
         raise
     except Exception as e:
         logger.error(f"Failed to classify PDF: {e}")
@@ -263,79 +265,47 @@ def get_extreme_aspect_ratio_page_pdfium(
 ) -> tuple[Any, Any]:
     with pdfium_guard():
         for page_index in page_indices:
-            page = None
-            try:
-                page = pdf_doc[page_index]
-                page_width, page_height = page.get_size()
-                if page_width <= 0 or page_height <= 0:
-                    continue
+            # FPDF_GetPageSizeByIndexF 直接按索引取 MediaBox 尺寸，不加载页面、
+            # 不解析内容流；矢量密集页一次 FPDF_LoadPage 可达数秒。
+            page_width, page_height = pdf_doc.get_page_size(page_index)
+            if page_width <= 0 or page_height <= 0:
+                continue
 
-                aspect_ratio = max(page_width / page_height, page_height / page_width)
-                if aspect_ratio > max_page_aspect_ratio:
-                    return page_index, aspect_ratio
-            finally:
-                close_pdfium_child(page)
+            aspect_ratio = max(page_width / page_height, page_height / page_width)
+            if aspect_ratio > max_page_aspect_ratio:
+                return page_index, aspect_ratio
 
     return None, None
 
 
 def _collect_pdfium_text_sample_from_page(page_index: int, page: Any) -> dict[str, Any]:
-    """从单页 PDFium 对象提取纯 Python 文本统计，并在调用方释放子对象。"""
+    """从单页原生统计快照物化分类字段，并及时释放 PDFium 文本页。"""
+    from .classification_bridge import read_classification_snapshot
+
     text_page = None
     try:
         text_page = page.get_textpage()
         text = text_page.get_text_bounded()
         char_count = text_page.count_chars()
-        null_char_count = 0
-        replacement_char_count = 0
-        control_char_count = 0
-        private_use_char_count = 0
-        unicode_map_error_count = 0
-        font_name_counts = {}
-        non_generated_char_count = 0
-        font_non_generated_char_counts = {}
-        font_non_generated_cjk_char_counts = {}
-
-        for char_index in range(char_count):
-            unicode_code = pdfium_c.FPDFText_GetUnicode(text_page, char_index)
-            is_generated = pdfium_c.FPDFText_IsGenerated(text_page, char_index) == 1
-            if not is_generated:
-                non_generated_char_count += 1
-
-            if unicode_code == 0:
-                null_char_count += 1
-            elif unicode_code == 0xFFFD:
-                replacement_char_count += 1
-            elif _is_disallowed_control_unicode(unicode_code):
-                control_char_count += 1
-            elif _PRIVATE_USE_AREA_START <= unicode_code <= _PRIVATE_USE_AREA_END:
-                private_use_char_count += 1
-
-            if pdfium_c.FPDFText_HasUnicodeMapError(text_page, char_index):
-                unicode_map_error_count += 1
-
-            font_name = _normalize_pdf_font_name(_get_pdfium_char_font_name(text_page, char_index))
-            if font_name:
-                font_name_counts[font_name] = font_name_counts.get(font_name, 0) + 1
-                if not is_generated:
-                    font_non_generated_char_counts[font_name] = font_non_generated_char_counts.get(font_name, 0) + 1
-                    if _is_cjk_unicode_code(unicode_code):
-                        font_non_generated_cjk_char_counts[font_name] = font_non_generated_cjk_char_counts.get(font_name, 0) + 1
-
+        try:
+            snapshot = read_classification_snapshot(
+                text_page,
+                char_count,
+                CJK_TEXT_RANGES,
+                _ALLOWED_CONTROL_CODES,
+                (_PRIVATE_USE_AREA_START, _PRIVATE_USE_AREA_END),
+                _normalize_pdf_font_name,
+            )
+        except PdfiumFontError:
+            raise
+        except Exception as exc:
+            raise NativeClassificationError("Native PDF classification statistics failed") from exc
         return {
             "page_index": page_index,
             "text": text,
             "cleaned_text": re.sub(r"\s+", "", text),
             "char_count": char_count,
-            "null_char_count": null_char_count,
-            "replacement_char_count": replacement_char_count,
-            "control_char_count": control_char_count,
-            "private_use_char_count": private_use_char_count,
-            "unicode_map_error_count": unicode_map_error_count,
-            "font_name_counts": font_name_counts,
-            "non_generated_char_count": non_generated_char_count,
-            "font_non_generated_char_counts": font_non_generated_char_counts,
-            "font_non_generated_cjk_char_counts": font_non_generated_cjk_char_counts,
+            **snapshot.to_dict(),
         }
     finally:
         close_pdfium_child(text_page)
@@ -350,11 +320,29 @@ def _collect_pdfium_text_samples(pdf_doc: pdfium.PdfDocument, page_indices: list
             page = None
             try:
                 page = pdf_doc[page_index]
-                text_samples.append(_collect_pdfium_text_sample_from_page(page_index, page))
+                sample = _collect_pdfium_text_sample_from_page(page_index, page)
+                # 同一次页面加载顺带统计图像覆盖率，末尾的覆盖检查不再重新加载页面。
+                from .classification_visuals import _image_rectangles, image_text_signal, page_image_coverage
+
+                images = _image_rectangles(page)
+                sample["image_coverage_ratio"] = page_image_coverage(page, images)
+                sample.update(image_text_signal(page, len(sample["cleaned_text"]), CHARS_THRESHOLD, images))
+                text_samples.append(sample)
             finally:
                 close_pdfium_child(page)
 
     return text_samples
+
+
+def _get_high_image_coverage_ratio_from_samples(text_samples: list[dict[str, Any]]) -> float:
+    """基于已缓存抽样页的图像覆盖率统计高覆盖页占比。"""
+
+    if not text_samples:
+        return 0.0
+    high_image_coverage_pages = sum(
+        sample.get("image_coverage_ratio", 0.0) >= HIGH_IMAGE_COVERAGE_THRESHOLD for sample in text_samples
+    )
+    return high_image_coverage_pages / len(text_samples)
 
 
 def _get_avg_cleaned_chars_per_page_from_samples(text_samples: list[dict[str, Any]]) -> float:
@@ -878,12 +866,27 @@ def _count_identity_cid_string(value: Any) -> int:
 def _resource_graph_has_cid_without_to_unicode(
     resources: Any,
     font_analysis_cache: dict[tuple[Any, ...], dict[str, bool]],
-    active_form_keys: frozenset[tuple[Any, ...]] = frozenset(),
+    visited_form_keys: set[tuple[Any, ...]] | None = None,
+    visited_resource_keys: set[tuple[Any, ...]] | None = None,
 ) -> bool:
-    """递归检查页面及 Form 资源图中是否存在缺少 ToUnicode 的 Identity CID 字体。"""
+    """递归检查页面及 Form 资源图中是否存在缺少 ToUnicode 的 Identity CID 字体。
+
+    结果与路径无关，Form 和资源字典按对象身份各展开一次；此去重仅用于
+    资源可达性检查，不影响实际绘制实例或字形使用次数统计。
+    """
+    resource_ref = resources
     resources = _resolve_pdf_object(resources)
     if not resources:
         return False
+
+    if visited_form_keys is None:
+        visited_form_keys = set()
+    if visited_resource_keys is None:
+        visited_resource_keys = set()
+    resource_key = _get_pdf_object_cache_key(resource_ref, resources)
+    if resource_key in visited_resource_keys:
+        return False
+    visited_resource_keys.add(resource_key)
 
     fonts = _resolve_pdf_object(resources.get("/Font")) or {}
     for font_ref in fonts.values():
@@ -901,15 +904,17 @@ def _resource_graph_has_cid_without_to_unicode(
             continue
 
         form_key = _get_pdf_object_cache_key(xobject_ref, xobject)
-        if form_key in active_form_keys:
+        if form_key in visited_form_keys:
             continue
+        visited_form_keys.add(form_key)
         form_resources = xobject.get("/Resources")
         if form_resources is None:
             continue
         if _resource_graph_has_cid_without_to_unicode(
             form_resources,
             font_analysis_cache,
-            active_form_keys | {form_key},
+            visited_form_keys,
+            visited_resource_keys,
         ):
             return True
     return False
@@ -1086,17 +1091,11 @@ def _resolve_pdf_object(obj: Any) -> Any:
     return obj
 
 
-def _get_pdfium_page_object_bounds(page_object: Any) -> tuple[float, float, float, float]:
-    """兼容 pypdfium2 4.x/5.x，统一获取页面对象的边界坐标。"""
-    get_bounds = getattr(page_object, "get_bounds", None)
-    if callable(get_bounds):
-        return get_bounds()
+def _page_image_coverage_ratio(page: Any) -> float:
+    """统计应用父变换、累计裁剪和页面范围后的图像矩形并集覆盖率。"""
+    from .classification_visuals import page_image_coverage
 
-    get_pos = getattr(page_object, "get_pos", None)
-    if callable(get_pos):
-        return get_pos()
-
-    raise AttributeError("PDFium page object has neither get_bounds() nor get_pos()")
+    return page_image_coverage(page)
 
 
 def get_high_image_coverage_ratio_pdfium(pdf_doc: pdfium.PdfDocument, page_indices: list[int]) -> float:
@@ -1107,18 +1106,7 @@ def get_high_image_coverage_ratio_pdfium(pdf_doc: pdfium.PdfDocument, page_indic
             page = None
             try:
                 page = pdf_doc[page_index]
-                page_bbox: tuple[float, float, float, float] = page.get_bbox()
-                page_area = abs((page_bbox[2] - page_bbox[0]) * (page_bbox[3] - page_bbox[1]))
-                image_area = 0.0
-
-                for page_object in page.get_objects(filter=[pdfium_c.FPDF_PAGEOBJ_IMAGE], max_depth=3):
-                    try:
-                        left, bottom, right, top = _get_pdfium_page_object_bounds(page_object)
-                        image_area += max(0.0, right - left) * max(0.0, top - bottom)
-                    finally:
-                        close_pdfium_child(page_object)
-
-                coverage_ratio = min(image_area / page_area, 1.0) if page_area > 0 else 0.0
+                coverage_ratio = _page_image_coverage_ratio(page)
                 if coverage_ratio >= HIGH_IMAGE_COVERAGE_THRESHOLD:
                     high_image_coverage_pages += 1
             finally:
@@ -1136,3 +1124,11 @@ if __name__ == "__main__":
         p_bytes = f.read()
         pdf_doc = PDFDocument(p_bytes)
         logger.info(f"PDF classify result: {pdf_doc.classify()}")
+
+# 自定义统计规则保留原调用次序与异常语义，不由内核悄然覆盖。
+_STANDARD_CLASSIFICATION_FUNCTIONS = (
+    _is_disallowed_control_unicode,
+    _is_cjk_unicode_code,
+    _get_pdfium_char_font_name,
+    _normalize_pdf_font_name,
+)

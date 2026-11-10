@@ -28,7 +28,7 @@ from .geometry import (
 )
 from .layout_evidence import build_layout_evidence
 from .text_roles import metadata_field
-from .line_layout import _effective_text_row_gap, _infer_text_lanes, _line_effective_height
+from .line_layout import _effective_text_row_gap, _infer_text_lanes, _line_effective_height, _line_canonical_style_scale
 
 _PAGE_NUMBER_RE = re.compile(
     r"^\s*(?:page\s*)?[\-\u2013\u2014\u00b7\u2022]*\s*(?:\u7b2c\s*)?"
@@ -37,6 +37,9 @@ _PAGE_NUMBER_RE = re.compile(
     r"\s*(?:\u9875)?\s*[\-\u2013\u2014\u00b7\u2022]*\s*$",
     re.IGNORECASE,
 )
+
+# 页眉或页脚同伴块允许的最大高度占页面高度比例，近整页容器不允许仅凭与页码行重叠改判。
+_MARGINAL_ROW_MAX_HEIGHT_RATIO = 0.15
 
 
 def _classify_page_auxiliary_text(prepared: _PreparedPage) -> None:
@@ -49,6 +52,7 @@ def _classify_page_auxiliary_text(prepared: _PreparedPage) -> None:
         prepared.table_bboxes,
         prepared.drawing_lines,
         prepared.page_size,
+        prepared=prepared,
     )
     prepared.page_footnote_groups += _classify_page_footnotes(
         prepared.remaining_lines,
@@ -56,6 +60,7 @@ def _classify_page_auxiliary_text(prepared: _PreparedPage) -> None:
         prepared.drawing_lines,
         prepared.page_size,
         visual_bboxes=[block["bbox"] for block in prepared.fixed_blocks if block.get("type") == "image"],
+        prepared=prepared,
     )
 
 
@@ -163,6 +168,7 @@ def _classify_image_footnotes(
     page_size: tuple[float, float],
     *,
     reference_body_height: float | None = None,
+    prepared: _PreparedPage | None = None,
 ) -> None:
     """用图片、下缘长横线和紧凑小字的联合关系识别图表脚注。"""
 
@@ -202,12 +208,11 @@ def _classify_image_footnotes(
             body_samples = [_line_effective_height(line, bbox) for line, bbox in line_geometry]
         body_height = max(0.1, statistics.median(body_samples))
     local_images = [_rotate_bbox_to_upright(bbox, page_size, dominant_angle) for bbox in image_bboxes]
-    local_axis_lines = _transform_axis_lines(
-        drawing_lines,
-        page_size,
-        dominant_angle,
-    )
-
+    if prepared is None:
+        local_axis_lines = _transform_axis_lines(drawing_lines, page_size, dominant_angle)
+        table_lines = _confirmed_table_horizontal_lines(local_axis_lines, table_bboxes)
+    else:
+        local_axis_lines, table_lines = _prepared_local_axis_table_lines(prepared, dominant_angle)
     matched_source_indices: set[int] = set()
     for image_bbox in local_images:
         image_width = max(0.1, image_bbox[2] - image_bbox[0])
@@ -229,8 +234,7 @@ def _classify_image_footnotes(
             and 0.0 <= axis_line.bbox[1] - row_bottom <= max(0.01 * local_page_height, 0.75 * body_height)
             and not _rule_belongs_to_confirmed_table(
                 axis_line,
-                local_axis_lines,
-                table_bboxes,
+                table_lines,
                 local_page_width,
             )
         ]
@@ -270,6 +274,7 @@ def _classify_deferred_image_footnotes(
             prepared.drawing_lines,
             prepared.page_size,
             reference_body_height=body_height,
+            prepared=prepared,
         )
 
 
@@ -361,11 +366,13 @@ def _classify_page_footnotes(
     page_size: tuple[float, float],
     *,
     visual_bboxes: list[BBox] | None = None,
+    prepared: _PreparedPage | None = None,
+    reference_lines: list[_LineItem] | None = None,
 ) -> list[set[int]]:
     """识别主方向页脚注，并按触发分隔线返回来源编号分组。"""
 
     available = [line for line in lines if line.semantic_type is None]
-    if not available or not drawing_lines:
+    if not available:
         return []
     support_by_angle = _geometric_text_support_by_angle(available, page_size)
     if not support_by_angle:
@@ -401,14 +408,24 @@ def _classify_page_footnotes(
         # 脚注分隔线应对齐稳定栏锚点，不能被页眉或跨栏关键词的宽行扩张污染。
         recalculate_intervals=False,
     )
-    local_axis_lines = _transform_axis_lines(
-        drawing_lines,
-        page_size,
-        dominant_angle,
-    )
+    if prepared is None:
+        local_axis_lines = _transform_axis_lines(drawing_lines, page_size, dominant_angle)
+        table_lines = _confirmed_table_horizontal_lines(local_axis_lines, table_bboxes)
+    else:
+        local_axis_lines, table_lines = _prepared_local_axis_table_lines(prepared, dominant_angle)
 
-    candidate_groups: list[set[int]] = []
+    candidate_groups: list[set[int]] = _unruled_numbered_footnote_groups(line_geometry, local_page_size)
     visual_bboxes = visual_bboxes or []
+    # 图体是此规则的必要证据；没有图体时无需读取每个字符的上标编号。
+    if visual_bboxes:
+        candidate_groups.extend(
+            _chart_referenced_note_groups(
+                line_geometry,
+                visual_bboxes,
+                lambda: _native_note_reference_values(reference_lines or available),
+                local_page_size,
+            )
+        )
     for axis_line in local_axis_lines:
         if axis_line.orientation != "horizontal":
             continue
@@ -435,8 +452,7 @@ def _classify_page_footnotes(
         # 表格边界会产生断裂横线；除框内线段外，也排除与其同高且近邻的框外线段。
         if _rule_belongs_to_confirmed_table(
             axis_line,
-            local_axis_lines,
-            table_bboxes,
+            table_lines,
             local_page_width,
         ):
             continue
@@ -506,6 +522,167 @@ def _classify_page_footnotes(
     return page_footnote_groups
 
 
+def _native_note_reference_values(lines: list[_LineItem]) -> set[str]:
+    """读取行内小号且抬高的原生数字，给同字号无线脚注提供编号对应证据。"""
+    values = set()
+    for line in lines:
+        chars = [char for char in line.chars if str(char.get("char", "")).strip() and char.get("origin")]
+        if len(chars) < 4:
+            continue
+        heights = [char["bbox"][3] - char["bbox"][1] for char in chars]
+        reference_height = statistics.median(heights)
+        baseline = statistics.median(char["origin"][1] for char in chars)
+        digits = ""
+        for char in chars:
+            if (
+                str(char.get("char", "")).isdigit()
+                and char["bbox"][3] - char["bbox"][1] <= 0.82 * reference_height
+                and baseline - char["origin"][1] >= 0.15 * reference_height
+            ):
+                digits += str(char["char"])
+            else:
+                if 1 <= len(digits) <= 3:
+                    values.add(digits)
+                digits = ""
+        if 1 <= len(digits) <= 3:
+            values.add(digits)
+    return values
+
+
+def _chart_referenced_note_groups(line_geometry, visual_bboxes, references, page_size):
+    """图体下方的编号说明须有原生上标对应；同栏同式连续编号延续注释，正文列表和页脚不参与。"""
+    height = page_size[1]
+    ordered = sorted(line_geometry, key=lambda item: (item[1][1], item[1][0]))
+    pattern = re.compile(r"^\s*(\d{1,3})[.)]?\s+\S")
+    groups = []
+    consumed = set()
+    reference_values = None
+    for index, (first, bounds) in enumerate(ordered):
+        marker = pattern.match(first.text)
+        em = _line_effective_height(first, bounds)
+        if not marker or first.source_index in consumed or bounds[1] < 0.7 * height:
+            continue
+        charts = [
+            box
+            for box in visual_bboxes
+            if box[3] - box[1] >= 8 * em
+            and box[2] - box[0] >= 0.2 * page_size[0]
+            and 0.8 * em <= bounds[1] - box[3] <= 12 * em
+            and _bbox_axis_overlap_ratio(bounds, box, axis="x") >= 0.6
+        ]
+        if not charts or (first.dominant_font_weight or 400) >= 600:
+            continue
+        # 只有可能认领的图下注释才读取整页上标，必要证据与原有候选覆盖保持一致。
+        if reference_values is None:
+            reference_values = references() if callable(references) else references
+        if marker[1] not in reference_values:
+            continue
+        members = [(first, bounds)]
+        number = int(marker[1])
+        for line, box in ordered[index + 1 :]:
+            if _bbox_axis_overlap_ratio(bounds, box, axis="x") < 0.3:
+                continue
+            if (
+                not 0.85 * em <= _line_effective_height(line, box) <= 1.15 * em
+                or line.font_signature != first.font_signature
+                or abs(box[0] - bounds[0]) > 0.4 * em
+                or _effective_text_row_gap(members[-1], (line, box)) > 1.5 * em
+            ):
+                break
+            next_marker = pattern.match(line.text)
+            if next_marker:
+                if int(next_marker[1]) != number + 1:
+                    break
+                group = {item.source_index for item, _ in members}
+                groups.append(group)
+                consumed.update(group)
+                members = []
+                number += 1
+            members.append((line, box))
+        group = {item.source_index for item, _ in members}
+        groups.append(group)
+        consumed.update(group)
+    return groups
+
+
+def _unruled_numbered_footnote_groups(
+    line_geometry: list[tuple[_LineItem, BBox]],
+    page_size: tuple[float, float],
+) -> list[set[int]]:
+    """用底部编号、字号收缩与正文净空识别无线注释，同字号跨栏注释另需原生上标对应。"""
+    width, height = page_size
+    ordered = sorted(line_geometry, key=lambda item: (item[1][1], item[1][0]))
+    references = None
+    marker_pattern = re.compile(r"^\s*(\d{1,3})[.)]\s+\S")
+    groups = []
+    consumed = set()
+    for index, (first, bounds) in enumerate(ordered):
+        marker = marker_pattern.match(first.text)
+        if (
+            first.source_index in consumed
+            or bounds[1] < 0.7 * height
+            or not marker
+            or (first.dominant_font_weight or 400) >= 600
+        ):
+            continue
+        first_height = _line_effective_height(first, bounds)
+        above = [
+            (line, box)
+            for line, box in ordered[:index]
+            if _bbox_center_y(box) <= _bbox_center_y(bounds) - 0.5 * first_height
+            and box[2] - box[0] >= 0.25 * width
+            and _bbox_axis_overlap_ratio(box, bounds, axis="x") >= 0.3
+        ]
+        if len(above) < 3:
+            continue
+        body_height = statistics.median(_line_effective_height(line, box) for line, box in above)
+        # 松字框可能跨越下一行；按最近物理行及有效字高测量净空，避免遗漏重叠的参考文献续行。
+        nearest_above = max(above, key=lambda item: _bbox_center_y(item[1]))
+        gap = _effective_text_row_gap(nearest_above, (first, bounds))
+        shrunken = first_height <= 0.9 * body_height and gap >= 0.75 * body_height
+        body_left = statistics.median(box[0] for _, box in above)
+        spanning_geometry = (
+            bounds[2] - bounds[0] >= 0.65 * width
+            and first_height <= 1.25 * body_height
+            and gap >= 2 * body_height
+            and body_left - bounds[0] >= 0.5 * body_height
+        )
+        # 缩小字号已足以认领，或者跨栏几何不成立时，不重复扫描整页字符。
+        spanning_reference = False
+        if not shrunken and spanning_geometry:
+            if references is None:
+                references = _native_note_reference_values([line for line, _ in ordered])
+            spanning_reference = marker[1] in references
+        if not shrunken and not spanning_reference:
+            continue
+        members = [(first, bounds)]
+        for current, box in ordered[index + 1 :]:
+            if box[1] < bounds[1] or _bbox_axis_overlap_ratio(bounds, box, axis="x") < 0.3:
+                continue
+            current_height = _line_effective_height(current, box)
+            row_gap = _effective_text_row_gap(members[-1], (current, box))
+            if (
+                marker_pattern.match(current.text)
+                or current_height > 1.15 * first_height
+                or row_gap > 1.5 * first_height
+                or not bounds[0] - 0.4 * first_height <= box[0] <= bounds[0] + 2 * first_height
+            ):
+                break
+            # 独立页脚可能只比脚注略小；底边窄行及额外净空共同阻止页脚混入。
+            if (
+                box[1] >= 0.92 * height
+                and box[2] - box[0] <= 0.55 * (bounds[2] - bounds[0])
+                and current_height <= 0.95 * first_height
+                and row_gap >= 0.25 * first_height
+            ):
+                break
+            members.append((current, box))
+        group = {line.source_index for line, _ in members}
+        groups.append(group)
+        consumed.update(group)
+    return groups
+
+
 def _augment_footnote_groups_with_edge_markers(
     groups: list[set[int]],
     line_geometry: list[tuple[_LineItem, BBox]],
@@ -535,29 +712,52 @@ def _augment_footnote_groups_with_edge_markers(
                 group.add(line.source_index)
 
 
-def _rule_belongs_to_confirmed_table(
-    candidate: _LocalAxisLine,
+def _prepared_local_axis_table_lines(
+    prepared: _PreparedPage,
+    dominant_angle: int,
+) -> tuple[list[_LocalAxisLine], list[_LocalAxisLine]]:
+    """按页和主方向复用轴线变换及确认表格横线，输入身份变化时重新计算。"""
+
+    key = (dominant_angle, id(prepared.drawing_lines), id(prepared.table_bboxes))
+    cached = prepared.local_axis_table_cache.get(key)
+    if cached is not None:
+        return cached
+    local_axis_lines = _transform_axis_lines(prepared.drawing_lines, prepared.page_size, dominant_angle)
+    table_lines = _confirmed_table_horizontal_lines(local_axis_lines, prepared.table_bboxes)
+    result = (local_axis_lines, table_lines)
+    prepared.local_axis_table_cache[key] = result
+    return result
+
+
+def _confirmed_table_horizontal_lines(
     local_axis_lines: list[_LocalAxisLine],
     table_bboxes: list[BBox],
+) -> list[_LocalAxisLine]:
+    """按页预计算与确认表格框相交的横线，供所有候选排除判断复用。"""
+
+    return [
+        table_line
+        for table_line in local_axis_lines
+        if table_line.orientation == "horizontal"
+        and any(
+            _bbox_intersects(
+                _expand_bbox(table_line.original_bbox, max(0.5, table_line.width)),
+                table_bbox,
+            )
+            for table_bbox in table_bboxes
+        )
+    ]
+
+
+def _rule_belongs_to_confirmed_table(
+    candidate: _LocalAxisLine,
+    table_lines: list[_LocalAxisLine],
     local_page_width: float,
 ) -> bool:
     """把表格框内横线及其同高近邻断裂段一并排除，避免框外残段触发脚注。"""
 
-    if not table_bboxes:
-        return False
     maximum_segment_gap = 0.04 * local_page_width
-    for table_line in local_axis_lines:
-        if table_line.orientation != "horizontal":
-            continue
-        table_margin = max(0.5, table_line.width)
-        if not any(
-            _bbox_intersects(
-                _expand_bbox(table_line.original_bbox, table_margin),
-                table_bbox,
-            )
-            for table_bbox in table_bboxes
-        ):
-            continue
+    for table_line in table_lines:
         center_tolerance = max(1.0, candidate.width, table_line.width)
         if abs(_bbox_center_y(candidate.bbox) - _bbox_center_y(table_line.bbox)) > center_tolerance:
             continue
@@ -583,6 +783,53 @@ def _merge_overlapping_source_groups(groups: list[set[int]]) -> list[set[int]]:
     return sorted(merged, key=lambda group: min(group))
 
 
+def _native_lowercase_ink_height(line: _LineItem) -> float | None:
+    """取原生小写字形的稳健高度，用可见字形补充异常字体度量，不引入OCR。"""
+    heights = []
+    for char in line.chars:
+        text = str(char.get("char", ""))
+        box = _coerce_bbox(char.get("tight_bbox"))
+        if len(text) == 1 and "a" <= text <= "z" and box is not None and box[3] > box[1]:
+            heights.append(box[3] - box[1])
+    return statistics.median(heights) if len(heights) >= 6 else None
+
+
+def _single_line_ink_note_evidence(
+    first: _LineItem,
+    above: list[tuple[_LineItem, BBox]],
+    rule_bbox: BBox,
+    page_size: tuple[float, float],
+    body_height: float,
+) -> bool:
+    """页底通栏线、编号净空及相对字形缩小共同确认单行注释，普通编号正文不享受例外。"""
+    em = body_height
+    if (
+        rule_bbox[2] - rule_bbox[0] < 0.7 * page_size[0]
+        or _bbox_center_y(rule_bbox) < 0.8 * page_size[1]
+        or (first.dominant_font_weight or 400) >= 600
+        or abs(first.bbox[0] - rule_bbox[0]) > em
+        or first.bbox[2] - first.bbox[0] > 0.7 * (rule_bbox[2] - rule_bbox[0])
+        or not (match := re.match(r"^\s*\d{1,3}[.)]\s+", first.text))
+        or len(above) < 3
+        or any(first.bbox[1] - box[3] < 0.75 * em for _, box in above)
+    ):
+        return False
+    letters = [char for char in first.chars if str(char.get("char", "")).strip()]
+    marker_length = len(match.group().strip())
+    if len(letters) <= marker_length:
+        return False
+    marker = [_coerce_bbox(char.get("tight_bbox")) for char in letters[:marker_length]]
+    following = _coerce_bbox(letters[marker_length].get("tight_bbox"))
+    if following is None or any(box is None for box in marker):
+        return False
+    marker_box = _bbox_union_many(marker)
+    if marker_box[2] - marker_box[0] > 1.5 * em or following[0] - marker_box[2] < 0.5 * em:
+        return False
+    note_ink = _native_lowercase_ink_height(first)
+    body_ink = [height for line, _ in above if (height := _native_lowercase_ink_height(line)) is not None]
+    return note_ink is not None and len(body_ink) >= 3 and note_ink <= 0.85 * statistics.median(body_ink)
+
+
 def _footnote_lane_members(
     lane: _TextLane,
     rule_bbox: BBox,
@@ -599,6 +846,12 @@ def _footnote_lane_members(
     if not lane_lines:
         return set()
     lane_lines.sort(key=lambda item: (item[1][1], item[1][0], item[0].source_index))
+    # 显式图题已经在原生行入口标注，图题装饰横线不能重新把该行认领为页面脚注。
+    if any(
+        line.caption_start and bbox[1] >= rule_bbox[1] and bbox[1] <= rule_bbox[3] + 3 * _line_effective_height(line, bbox)
+        for line, bbox in lane_lines
+    ):
+        return set()
     local_page_width, local_page_height = local_page_size
     lane_width = max(
         0.1,
@@ -609,13 +862,40 @@ def _footnote_lane_members(
     median_height = statistics.median(lane_heights) if lane_heights else 1.0
     rule_width = max(0.0, rule_bbox[2] - rule_bbox[0])
     # 同时限制绝对短线、相对长线和左缘偏移，排除图标、公式线及跨栏正文分隔线。
-    if rule_width < max(4.0 * median_height, 0.04 * local_page_width):
+    requires_short_rule_evidence = rule_width < max(4.0 * median_height, 0.04 * local_page_width)
+    if requires_short_rule_evidence and rule_width < max(2.0 * median_height, 0.08 * lane_width):
         return set()
     strict_left_tolerance = max(
         2.0 * median_height,
         0.04 * lane_width,
     )
     strict_left_alignment = abs(rule_bbox[0] - lane.left) <= strict_left_tolerance
+    wide_body_heights = [
+        _line_effective_height(line, bounds)
+        for line, bounds in lane_lines
+        if bounds[3] <= rule_bbox[1] and bounds[2] - bounds[0] >= 0.35 * lane_width
+    ]
+    marker_body_reference = max(
+        median_height, page_median_height or 0, statistics.median(wide_body_heights) if len(wide_body_heights) >= 3 else 0
+    )
+    # 正文缩进不能替代脚注栏左缘；线下真实编号与小字正文同行时，由编号补足左缘证据。
+    numbered_left_alignment = any(
+        marker.note_marker_value is not None
+        and abs(bounds[0] - rule_bbox[0]) <= 0.5 * median_height
+        and 0 <= bounds[1] - rule_bbox[3] <= 3 * median_height
+        and bounds[2] - bounds[0] <= 1.25 * median_height
+        and any(
+            body_bounds[0] >= bounds[2]
+            and body_bounds[0] - bounds[2] <= 2 * median_height
+            and body_bounds[2] - body_bounds[0] >= 4 * median_height
+            and _bbox_axis_overlap_ratio(bounds, body_bounds, axis="y") >= 0.6
+            and _line_effective_height(body, body_bounds) <= 0.9 * marker_body_reference
+            for body, body_bounds in lane_lines
+            if body is not marker
+        )
+        for marker, bounds in lane_lines
+    )
+    strict_left_alignment = strict_left_alignment or numbered_left_alignment
     relaxed_left_alignment = rule_bbox[0] < lane.left and lane.left - rule_bbox[0] <= 2.25 * median_height
     rule_center_y = _bbox_center_y(rule_bbox)
     centered_short_alignment = (
@@ -627,7 +907,9 @@ def _footnote_lane_members(
     if not strict_left_alignment and not relaxed_left_alignment and not centered_short_alignment:
         return set()
 
-    is_regular_short_rule = rule_center_y >= 0.7 * local_page_height and rule_width <= 0.65 * lane_width
+    is_regular_short_rule = (
+        rule_center_y >= (0.55 if requires_short_rule_evidence else 0.7) * local_page_height and rule_width <= 0.65 * lane_width
+    )
     endpoint_tolerance = max(2.0 * median_height, 0.05 * lane_width)
     is_column_width_rule = (
         allow_column_width_rule
@@ -657,6 +939,43 @@ def _footnote_lane_members(
     if first_index is None:
         return set()
 
+    if is_regular_short_rule:
+        # 与上方正文框交叠的细线属于行内装饰，不是留白中的脚注分隔线；下行字号不能改变线的归属。
+        first_line, first_bbox = lane_lines[first_index]
+        if any(
+            bounds[1] < rule_center_y < bounds[3] and _bbox_axis_overlap_ratio(bounds, rule_bbox, axis="x") >= 0.5
+            for line, bounds in lane_lines[:first_index]
+        ):
+            return set()
+
+    if requires_short_rule_evidence:
+        # 不直接放宽短线门槛：小字编号、栏缘及上下净空必须同时成立，排除分式和章节线。
+        first_line, first_bbox = lane_lines[first_index]
+        above = [(line, bbox) for line, bbox in lane_lines[:first_index] if bbox[1] < rule_bbox[1]]
+        reference_height = max(
+            page_median_height or 0.0, statistics.median(_line_effective_height(*item) for item in above) if above else 0.0
+        )
+        numbered = first_line.footnote_marker_start or any(
+            bounds[2] - bounds[0] <= 1.5 * median_height
+            and abs(bounds[0] - rule_bbox[0]) <= 0.5 * median_height
+            and 0 <= first_bbox[0] - bounds[2] <= 1.5 * median_height
+            and _bbox_axis_overlap_ratio(bounds, first_bbox, axis="y") >= 0.6
+            for _line, bounds in lane_lines
+        )
+        # 跨页续注可能没有当前页首编号；分隔线左端与悬挂正文之间保留一字以上的编号槽。
+        marker_slot = median_height <= first_bbox[0] - rule_bbox[0] <= 2.25 * median_height
+        if (
+            not strict_left_alignment
+            or not (numbered or marker_slot)
+            or reference_height <= 0
+            or _line_effective_height(first_line, first_bbox) > 0.9 * reference_height
+            or any(
+                bbox[3] > rule_bbox[1] - 0.25 * reference_height or first_bbox[1] - bbox[3] < 0.75 * reference_height
+                for _line, bbox in above
+            )
+        ):
+            return set()
+
     if is_column_width_rule:
         # 页面中段的栏宽横线只有在下方首行相对上方正文明显收缩时才可触发脚注，
         # 避免把章节分隔线或普通栏内横线误当成脚注边界。
@@ -670,7 +989,49 @@ def _footnote_lane_members(
                 body_reference_height,
                 page_median_height,
             )
-        if len(body_heights) < 3 or first_height > 0.95 * body_reference_height:
+        first_line, first_bbox = lane_lines[first_index]
+        continuation_boxes = [
+            bounds
+            for _, bounds in lane_lines[first_index + 1 :]
+            if first_bbox[1] + 0.5 * median_height <= bounds[1] <= first_bbox[3] + 3 * median_height
+        ]
+        continuation_left = (
+            statistics.median(bounds[0] for bounds in continuation_boxes) if continuation_boxes else first_bbox[0]
+        )
+        prefix_bbox = first_line.source_bbox or first_bbox
+        # 同字号通栏脚注须同时有独立编号槽、悬挂续行和正文净空，普通章节分隔线不享受此例外。
+        hanging_note = (
+            rule_width >= 0.7 * local_page_width
+            and rule_center_y >= 0.75 * local_page_height
+            and (first_line.dominant_font_weight or 400) < 600
+            and first_height <= 1.25 * body_reference_height
+            and (
+                prefix_bbox[2] - prefix_bbox[0] <= 1.5 * median_height
+                and abs(prefix_bbox[0] - rule_bbox[0]) <= median_height
+                and 0.5 * median_height <= continuation_left - prefix_bbox[2] <= 2 * median_height
+                or any(
+                    bounds[2] - bounds[0] <= 1.5 * median_height
+                    and abs(bounds[0] - rule_bbox[0]) <= median_height
+                    and 0 <= first_bbox[0] - bounds[2] <= 2 * median_height
+                    and _bbox_axis_overlap_ratio(bounds, first_bbox, axis="y") >= 0.8
+                    for _, bounds in lane_lines
+                )
+            )
+            and sum(abs(bounds[0] - continuation_left) <= 0.3 * median_height for bounds in continuation_boxes) >= 2
+            and all(
+                first_bbox[1] - bounds[3] >= 0.75 * body_reference_height
+                for _, bounds in lane_lines[:first_index]
+                if bounds[3] <= rule_bbox[1]
+            )
+        )
+        single_line_ink_note = _single_line_ink_note_evidence(
+            first_line,
+            [(line, bounds) for line, bounds in lane_lines[:first_index] if bounds[3] <= rule_bbox[1]],
+            rule_bbox,
+            local_page_size,
+            body_reference_height,
+        )
+        if len(body_heights) < 3 or first_height > 0.95 * body_reference_height and not (hanging_note or single_line_ink_note):
             return set()
 
     continuation_gap_limit = _page_footnote_continuation_gap_limit(
@@ -800,11 +1161,9 @@ def _classify_rule_delimited_headers(pages: list[_PreparedPage]) -> None:
         ]
         heights = [_line_effective_height(line, bbox) for line, bbox in local_lines]
         median_height = statistics.median(heights) if heights else 1.0
-        local_axis_lines = _transform_axis_lines(
-            page.drawing_lines,
-            page.page_size,
-            dominant_angle,
-        )
+        canonical_scales = [_line_canonical_style_scale(line, bbox) for line, bbox in local_lines]
+        median_scale = statistics.median(canonical_scales) if canonical_scales else median_height
+        local_axis_lines, table_lines = _prepared_local_axis_table_lines(page, dominant_angle)
         candidates = [
             axis_line
             for axis_line in local_axis_lines
@@ -814,8 +1173,7 @@ def _classify_rule_delimited_headers(pages: list[_PreparedPage]) -> None:
             and any(bbox[3] <= _bbox_center_y(axis_line.bbox) for bbox in header_evidence_bboxes)
             and not _rule_belongs_to_confirmed_table(
                 axis_line,
-                local_axis_lines,
-                page.table_bboxes,
+                table_lines,
                 local_page_width,
             )
             and not _rule_overlaps_fixed_container(
@@ -831,7 +1189,15 @@ def _classify_rule_delimited_headers(pages: list[_PreparedPage]) -> None:
         if not any(_bbox_center_y(bbox) >= separator_y + median_height for _line, bbox in local_lines):
             continue
         for line, bbox in local_lines:
-            if bbox[3] <= separator_y:
+            if bbox[3] <= separator_y and not line.caption_start:
+                if _line_canonical_style_scale(line, bbox) >= 1.5 * median_scale:
+                    # 装饰横线也会包围真正章节标题；显著大于正文的文字不能仅凭页首横线成为页眉。
+                    # 使用字形校准尺度，避免上下两行包络重叠把小号日期误当作大标题。
+                    if line.numbered_heading_start:
+                        line.semantic_type = "paragraph_title"
+                        line.structural_title = True
+                        line.explicit_section_title = True
+                    continue
                 line.semantic_type = "header"
 
 
@@ -856,11 +1222,7 @@ def _classify_rule_delimited_footers(pages: list[_PreparedPage]) -> None:
         local_page_width, local_page_height = local_page_size
         if local_page_width <= 0 or local_page_height <= 0:
             continue
-        local_axis_lines = _transform_axis_lines(
-            page.drawing_lines,
-            page.page_size,
-            dominant_angle,
-        )
+        local_axis_lines, table_lines = _prepared_local_axis_table_lines(page, dominant_angle)
         rules = [
             rule
             for rule in local_axis_lines
@@ -869,8 +1231,7 @@ def _classify_rule_delimited_footers(pages: list[_PreparedPage]) -> None:
             and rule.bbox[2] - rule.bbox[0] >= 0.2 * local_page_width
             and not _rule_belongs_to_confirmed_table(
                 rule,
-                local_axis_lines,
-                page.table_bboxes,
+                table_lines,
                 local_page_width,
             )
             and not _rule_overlaps_fixed_container(
@@ -1058,6 +1419,7 @@ def _classify_page_number_outer_companions(
                     angle,
                 )
                 is_outward = local_bbox[3] <= outward_limit if target_type == "header" else local_bbox[1] >= outward_limit
+                # 同一边缘行还要求候选自身是窄带对象；近整页的大容器只蹭到页码行边时不算同行。
                 same_marginal_row = (
                     _bbox_axis_overlap_ratio(
                         local_bbox,
@@ -1065,6 +1427,7 @@ def _classify_page_number_outer_companions(
                         axis="y",
                     )
                     >= 0.5
+                    and local_bbox[3] - local_bbox[1] <= _MARGINAL_ROW_MAX_HEIGHT_RATIO * local_page_height
                 )
                 if is_outward or same_marginal_row:
                     line.semantic_type = target_type
@@ -1086,6 +1449,7 @@ def _classify_page_number_outer_companions(
                     angle,
                 )
                 is_outward = local_bbox[3] <= outward_limit if target_type == "header" else local_bbox[1] >= outward_limit
+                # 同一边缘行还要求图片自身是窄带对象；近整页的大图只蹭到页码行边时不算同行。
                 same_marginal_row = (
                     _bbox_axis_overlap_ratio(
                         local_bbox,
@@ -1093,6 +1457,7 @@ def _classify_page_number_outer_companions(
                         axis="y",
                     )
                     >= 0.5
+                    and local_bbox[3] - local_bbox[1] <= _MARGINAL_ROW_MAX_HEIGHT_RATIO * local_page_height
                 )
                 if is_outward or same_marginal_row:
                     block["type"] = target_type
@@ -1648,7 +2013,7 @@ def _build_marginal_candidate(
 ) -> _MarginalCandidate | None:
     """把页面上下百分之十五内的常规小行转换成跨页比较候选。"""
 
-    if line.semantic_type not in {None, "page_footnote"}:
+    if line.semantic_type not in {None, "page_footnote"} or line.caption_start:
         return None
     local_bbox = _rotate_bbox_to_upright(line.bbox, page_size, line.angle)
     local_page_size = (page_size[1], page_size[0]) if line.angle in {90, 270} else page_size
@@ -1835,6 +2200,9 @@ def _marginal_text_matches(first_text: str, second_text: str) -> bool:
 
     # 公式编号在数字屏蔽后都会成为同一标记，不能作为重复页脚的文本证据。
     if any(re.fullmatch(r"[（(﹙]\s*[A-Za-z]?\d+(?:[.\-]\d+)*\s*[)）﹚]", text.strip()) for text in (first_text, second_text)):
+        return False
+    # 层级条目号携带正文身份，不能把不同条目经数字屏蔽后当作重复刊头。
+    if any(re.fullmatch(r"\d+(?:\.\d+)+", text.strip()) for text in (first_text, second_text)):
         return False
     first = _normalize_marginal_text(first_text)
     second = _normalize_marginal_text(second_text)

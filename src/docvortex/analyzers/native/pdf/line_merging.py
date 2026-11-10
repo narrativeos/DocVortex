@@ -5,6 +5,7 @@ from __future__ import annotations
 from .layout_evidence import build_layout_evidence
 
 import re
+from bisect import bisect_right
 import statistics
 import unicodedata
 import heapq
@@ -23,6 +24,31 @@ from .line_layout import _connection_crosses_table, _font_signatures_share_famil
 from .models import _LineItem, _TextLane
 from .native_text import _fill_native_typography, _median_native_glyph_width
 from ._script_geometry import classify_char_script_roles, paired_script_roles
+from ._interval_candidates import IntervalCandidates
+
+
+def _inherit_unanimous_structural_membership(merged: _LineItem, members: list[_LineItem]) -> None:
+    """同行片段共享明确段组或标题带时传递归属；不同归属不能由合并操作猜测。"""
+    if not members:
+        return
+    ordered = sorted(members, key=lambda line: line.bbox[0])
+    # 悬挂序号与标签合成同行时，传递标签释放字符前冻结的真实左缘。
+    if (
+        len(ordered) == 2
+        and re.fullmatch(r"(?:[A-Za-z]|\d{1,2})[.)]", ordered[0].text.strip())
+        and ordered[0].font_signature == ordered[1].font_signature
+    ):
+        merged.native_title_label_left = ordered[1].native_title_label_left
+    paragraph_group = members[0].paragraph_group
+    if paragraph_group is not None and all(member.paragraph_group == paragraph_group for member in members):
+        merged.paragraph_group = paragraph_group
+    title_band_id = members[0].title_band_id
+    if title_band_id is not None and all(member.title_band_id == title_band_id for member in members):
+        merged.title_band_id = title_band_id
+        merged.structural_title = all(member.structural_title for member in members)
+        merged.explicit_section_title = all(member.explicit_section_title for member in members)
+    # 确认的正文也有标题反证；它不需要标题带身份，同行重建不能丢掉该边界。
+    merged.title_suppressed = all(member.title_suppressed for member in members)
 
 
 def _caption_crosses_left_text(members: list[_LineItem]) -> bool:
@@ -37,12 +63,33 @@ def _caption_crosses_left_text(members: list[_LineItem]) -> bool:
     )
 
 
+def _safe_candidate_box(box) -> bool:
+    """仅让内置浮点坐标进入预筛，整数算术和其他类型保留参考遍历。"""
+    return (
+        type(box) in (tuple, list)
+        and len(box) == 4
+        and all(type(v) is float and abs(v) <= 1e100 and math.isfinite(v) for v in box)
+        and box[2] > box[0]
+        and box[3] > box[1]
+    )
+
+
+def _overlapping_candidate_pairs(members):
+    """纵向区间是重叠连接的必要条件，原行序及最终判断保持不变。"""
+    if len(members) <= 16 or any(not _safe_candidate_box(box) for _, box in members):
+        return None
+    groups = {}
+    for i, (line, _) in enumerate(members):
+        groups.setdefault((line.angle, line.formula_candidate_only, line.semantic_type), []).append(i)
+    return IntervalCandidates([(box[1], box[3]) for _, box in members], groups)
+
+
 def _same_baseline_candidate_pairs(
     lines: list[_LineItem],
     local_bboxes: list[BBox],
     compatible_indices: dict[tuple[int, bool, str | None], list[int]],
-) -> list[list[int]] | None:
-    """仅筛除原规则不可能接受的纵向远距行对；异常或密集页面回退原遍历。"""
+) -> list[list[int]] | IntervalCandidates | None:
+    """筛除纵向远距行对，密集页面流式查询，异常几何保留原遍历。"""
     bounds: list[tuple[float, float]] = []
     for line, box in zip(lines, local_bboxes, strict=True):
         try:
@@ -65,6 +112,16 @@ def _same_baseline_candidate_pairs(
             return None
         bounds.append((low, high))
 
+    if len(lines) >= 32:
+        heights = [_line_effective_height(line, box) for line, box in zip(lines, local_bboxes)]
+        sources = [line.source_bbox if line.angle == 0 and line.baseline is not None else None for line in lines]
+        if (
+            all(_safe_candidate_box(box) for box in local_bboxes)
+            and all(box is None or _safe_candidate_box(box) for box in sources)
+            and all(type(h) is float and math.isfinite(h) and abs(h) <= 1e100 for h in heights)
+        ):
+            return IntervalCandidates(bounds, compatible_indices, geometry=(local_bboxes, heights, sources))
+
     candidates: list[list[int]] = [[] for _ in lines]
     pair_count = 0
     pair_limit = max(4096, 32 * len(lines))
@@ -79,7 +136,7 @@ def _same_baseline_candidate_pairs(
                 active.remove(expired)
             pair_count += len(active)
             if pair_count > pair_limit:
-                return None
+                return IntervalCandidates(bounds, compatible_indices)
             for previous in active:
                 left, right = (previous, index) if previous < index else (index, previous)
                 candidates[left].append(right)
@@ -210,8 +267,12 @@ def _merge_overlapping_inline_text_clusters(
                 if first_root != second_root:
                     parents[second_root] = first_root
 
+            candidate_pairs = _overlapping_candidate_pairs(lane.lines)
             for first_index, first in enumerate(lane.lines):
-                for second_index in range(first_index + 1, len(lane.lines)):
+                partners = (
+                    candidate_pairs[first_index] if candidate_pairs is not None else range(first_index + 1, len(lane.lines))
+                )
+                for second_index in partners:
                     second = lane.lines[second_index]
                     if _overlapping_inline_cluster_pair_is_connected(
                         first,
@@ -464,6 +525,7 @@ def _merge_overlapping_inline_cluster(
         leading_typography_width=ordered_members[0].leading_typography_width,
         paragraph_terminal=ordered_members[-1].paragraph_terminal,
         caption_start=any(member.caption_start for member in ordered_members),
+        native_math_words=frozenset(word for member in ordered_members for word in member.native_math_words),
         paragraph_formula_context=any(line.paragraph_formula_context for line in ordered_members),
         split_from_row=any(line.split_from_row for line in ordered_members),
         preserve_split_boundary=any(line.preserve_split_boundary for line in ordered_members),
@@ -477,6 +539,7 @@ def _merge_overlapping_inline_cluster(
             *detected_regions,
         ],
     )
+    _inherit_unanimous_structural_membership(merged, ordered_members)
     if merged.chars:
         _fill_native_typography(merged, page_size)
     return merged
@@ -493,6 +556,11 @@ def _merge_post_semantic_text_runs(
         return list(lines)
     local_bboxes = [_rotate_bbox_to_upright(line.bbox, page_size, line.angle) for line in lines]
     layout = build_layout_evidence(lines, page_size, barriers=table_bboxes)
+    candidate_index = _post_semantic_candidate_pairs(lines, local_bboxes)
+    candidates, heights = candidate_index if candidate_index is not None else (None, None)
+    physical_rows: dict[tuple[int, int], tuple[bool, BBox]] = {}
+    supporting_rows = sorted((line.bbox[1], index) for index, line in enumerate(lines)) if candidates is not None else []
+    supporting_tops = [top for top, _index in supporting_rows]
     parents = list(range(len(lines)))
 
     def find(index: int) -> int:
@@ -515,8 +583,8 @@ def _merge_post_semantic_text_runs(
         if first_line.semantic_type is not None:
             continue
         first_bbox = local_bboxes[first_index]
-        first_height = _line_effective_height(first_line, first_bbox)
-        for second_index in range(first_index + 1, len(lines)):
+        first_height = heights[first_index] if heights is not None else _line_effective_height(first_line, first_bbox)
+        for second_index in candidates[first_index] if candidates is not None else range(first_index + 1, len(lines)):
             second_line = lines[second_index]
             if _caption_crosses_left_text([first_line, second_line]):
                 continue
@@ -531,30 +599,44 @@ def _merge_post_semantic_text_runs(
             ):
                 continue
             second_bbox = local_bboxes[second_index]
-            second_height = _line_effective_height(second_line, second_bbox)
+            second_height = heights[second_index] if heights is not None else _line_effective_height(second_line, second_bbox)
             left, right = sorted((first_bbox, second_bbox), key=lambda bbox: bbox[0])
             pair_height = min(first_height, second_height)
-            shared_physical_row = (
-                first_line.visual_row_id is not None
-                and first_line.visual_row_id == second_line.visual_row_id
-                # 宽空格放宽只服务连续文字，数值列与标签列不能据此跨单元格连接。
-                and all(
+            same_physical_row = first_line.visual_row_id is not None and first_line.visual_row_id == second_line.visual_row_id
+            row_key = (first_line.angle, first_line.visual_row_id)
+            if same_physical_row and candidates is not None and row_key not in physical_rows:
+                members = [
+                    index
+                    for index, member in enumerate(lines)
+                    if member.angle == row_key[0] and member.visual_row_id == row_key[1]
+                ]
+                physical_rows[row_key] = (
+                    all(any(char.isalpha() for char in lines[index].text) for index in members),
+                    _bbox_union_many([local_bboxes[index] for index in members]),
+                )
+            shared_physical_row = same_physical_row and (
+                physical_rows[row_key][0]
+                if candidates is not None
+                else all(
                     any(char.isalpha() for char in member.text)
                     for member in lines
                     if member.angle == first_line.angle and member.visual_row_id == first_line.visual_row_id
                 )
             )
-            row_bounds = (
-                _bbox_union_many(
-                    [
-                        local_bboxes[index]
-                        for index, member in enumerate(lines)
-                        if member.angle == first_line.angle and member.visual_row_id == first_line.visual_row_id
-                    ]
+            if shared_physical_row:
+                row_bounds = (
+                    physical_rows[row_key][1]
+                    if candidates is not None
+                    else _bbox_union_many(
+                        [
+                            local_bboxes[index]
+                            for index, member in enumerate(lines)
+                            if member.angle == first_line.angle and member.visual_row_id == first_line.visual_row_id
+                        ]
+                    )
                 )
-                if shared_physical_row
-                else _bbox_union_many([first_bbox, second_bbox])
-            )
+            else:
+                row_bounds = _bbox_union_many([first_bbox, second_bbox])
             justified_row = (
                 first_line.font_signature == second_line.font_signature
                 and first_line.paragraph_group == second_line.paragraph_group
@@ -562,13 +644,17 @@ def _merge_post_semantic_text_runs(
                 and abs(_bbox_center_y(first_bbox) - _bbox_center_y(second_bbox)) < 0.2 * pair_height
                 and 0 <= right[0] - left[2] <= (3 if shared_physical_row else 2) * pair_height
                 and not layout.separated(first_bbox, second_bbox)
-                and any(
-                    other is not first_line
-                    and other is not second_line
-                    and 0 < other.bbox[1] - max(first_bbox[3], second_bbox[3]) <= pair_height
-                    and abs(other.bbox[0] - row_bounds[0]) < (1.5 if shared_physical_row else 1) * pair_height
-                    and other.bbox[2] >= row_bounds[2] - pair_height
-                    for other in lines
+                and _post_semantic_supports_row(
+                    lines,
+                    first_index,
+                    second_index,
+                    first_bbox,
+                    second_bbox,
+                    row_bounds,
+                    pair_height,
+                    shared_physical_row,
+                    supporting_rows if candidates is not None else None,
+                    supporting_tops,
                 )
             )
             if (
@@ -614,6 +700,74 @@ def _merge_post_semantic_text_runs(
         )
     )
     return output
+
+
+def _post_semantic_candidate_pairs(
+    lines: list[_LineItem], local_bboxes: list[BBox]
+) -> tuple[IntervalCandidates, list[float]] | None:
+    """两条后处理合并路径共用纵向安全超集，保留原始行对枚举顺序。"""
+
+    if len(lines) <= 32 or any(
+        type(line) is not _LineItem
+        or not _safe_candidate_box(box)
+        or not _safe_candidate_box(line.bbox)
+        or type(line.angle) is not int
+        or type(line.formula_candidate_only) is not bool
+        or (line.semantic_type is not None and type(line.semantic_type) is not str)
+        or (line.visual_row_id is not None and type(line.visual_row_id) is not int)
+        or type(line.text) is not str
+        for line, box in zip(lines, local_bboxes, strict=True)
+    ):
+        return None
+    bounds = []
+    heights = []
+    groups = {}
+    for index, (line, box) in enumerate(zip(lines, local_bboxes, strict=True)):
+        height = _line_effective_height(line, box)
+        if type(height) is not float or not math.isfinite(height) or height > 1e100:
+            return None
+        low, high = box[1] - 0.2 * height, box[3] + 0.2 * height
+        if not math.isfinite(low) or not math.isfinite(high):
+            return None
+        bounds.append((low, high))
+        heights.append(height)
+        groups.setdefault((line.angle, line.formula_candidate_only, line.semantic_type), []).append(index)
+    return IntervalCandidates(bounds, groups), heights
+
+
+def _post_semantic_supports_row(
+    lines: list[_LineItem],
+    first_index: int,
+    second_index: int,
+    first_bbox: BBox,
+    second_bbox: BBox,
+    row_bounds: BBox,
+    pair_height: float,
+    shared_physical_row: bool,
+    supporting_rows: list[tuple[float, int]] | None,
+    supporting_tops: list[float],
+) -> bool:
+    """按原条件检查后续正文行；普通几何只查询必要的纵向带。"""
+
+    bottom = max(first_bbox[3], second_bbox[3])
+    if supporting_rows is None:
+        indices = range(len(lines))
+    else:
+        start = bisect_right(supporting_tops, bottom)
+        end = bisect_right(supporting_tops, bottom + pair_height)
+        indices = sorted(index for _top, index in supporting_rows[start:end])
+    for index in indices:
+        other = lines[index]
+        if (
+            index not in (first_index, second_index)
+            and other is not lines[first_index]
+            and other is not lines[second_index]
+            and 0 < other.bbox[1] - bottom <= pair_height
+            and abs(other.bbox[0] - row_bounds[0]) < (1.5 if shared_physical_row else 1) * pair_height
+            and other.bbox[2] >= row_bounds[2] - pair_height
+        ):
+            return True
+    return False
 
 
 def _post_semantic_same_baseline_geometry(
@@ -767,6 +921,21 @@ def _same_baseline_geometry(
     return -0.25 * pair_height <= signed_gap <= gap_limit
 
 
+def _bullet_body_typography_member(members: list[_LineItem]) -> _LineItem | None:
+    """游离圆点只是项目标记，合行的字体统计应继承右侧主要文字，不能让符号字体覆盖整行正文。"""
+    first = members[0]
+    if (
+        len(members) < 2
+        or first.text.strip() not in {"•", "●", "▪"}
+        or first.bbox[2] - first.bbox[0] > _line_effective_height(first, first.bbox)
+    ):
+        return None
+    body = max(members[1:], key=lambda line: len(line.text.strip()))
+    if len(re.findall(r"[A-Za-z]{2,}|[\u3400-\u9fff]", body.text)) < 2:
+        return None
+    return body
+
+
 def _merge_same_baseline_group(
     indices: list[int],
     lines: list[_LineItem],
@@ -776,6 +945,7 @@ def _merge_same_baseline_group(
     """按局部 x 顺序合并一个同基线分量，并保留全部字符与几何信息。"""
 
     members = [lines[index] for index in indices]
+    body_typography = _bullet_body_typography_member(members)
     content_parts = [members[0].text.strip()]
     for previous_index, current_index in zip(indices, indices[1:]):
         previous_bbox = local_bboxes[previous_index]
@@ -820,8 +990,8 @@ def _merge_same_baseline_group(
         run_index=min(member.run_index for member in members),
         effective_height=statistics.median(member.effective_height for member in members),
         em_height=statistics.median(member.em_height or member.effective_height for member in members),
-        font_signature=members[0].font_signature,
-        font_coverage=min(member.font_coverage for member in members),
+        font_signature=(body_typography or members[0]).font_signature,
+        font_coverage=body_typography.font_coverage if body_typography else min(member.font_coverage for member in members),
         dominant_font_weight=statistics.median(
             member.dominant_font_weight for member in members if member.dominant_font_weight is not None
         )
@@ -836,6 +1006,7 @@ def _merge_same_baseline_group(
         leading_typography_width=members[0].leading_typography_width,
         paragraph_terminal=members[-1].paragraph_terminal,
         caption_start=any(member.caption_start for member in members),
+        native_math_words=frozenset(word for member in members for word in member.native_math_words),
         paragraph_formula_context=any(member.paragraph_formula_context for member in members),
         split_from_row=any(member.split_from_row for member in members),
         preserve_split_boundary=any(member.preserve_split_boundary for member in members),
@@ -846,6 +1017,7 @@ def _merge_same_baseline_group(
         style_scale_repaired=any(member.style_scale_repaired for member in members),
         inline_math_regions=[region for member in members for region in member.inline_math_regions],
     )
+    _inherit_unanimous_structural_membership(merged, members)
     if merged.chars:
         _fill_native_typography(merged, page_size)
     return merged
@@ -978,6 +1150,8 @@ def _demote_runin_title_fragments(lines: list[_LineItem], page_size: tuple[float
                 for prefix in lines:
                     if (
                         prefix.semantic_type == "paragraph_title"
+                        # 单独字母序号是下一项的前缀，不是上一标题的换行碎片，不能向上传播降级。
+                        and re.fullmatch(r"[a-zA-Z][.)]", line.text.strip()) is None
                         and prefix.angle == line.angle
                         and not prefix.explicit_section_title
                         and abs(prefix.bbox[0] - line.bbox[0]) < height
@@ -987,6 +1161,78 @@ def _demote_runin_title_fragments(lines: list[_LineItem], page_size: tuple[float
                         prefix.semantic_type = None
                         prefix.title_suppressed = True
                 break
+
+
+def _merge_metric_heading_fragments(
+    lines: list[_LineItem],
+    page_size: tuple[float, float],
+) -> list[_LineItem]:
+    """同排大号标题为数值指标提供版式证据，仅聚合紧邻方向箭头及引用上标，保留下一行说明。"""
+    consumed: set[int] = set()
+    merged_lines: list[_LineItem] = []
+    for value in lines:
+        if (
+            value.source_index in consumed
+            or value.semantic_type not in {None, "paragraph_title"}
+            or value.caption_start
+            or value.paragraph_terminal
+            or value.font_signature is None
+            or value.font_coverage < 0.75
+            or value.formula_candidate_only
+            or value.compact_formula_cluster
+            or re.fullmatch(r"\d+(?:[.,]\d+)?\s*(?:[A-Za-z]{1,4}|[%×])", value.text.strip()) is None
+        ):
+            continue
+        bounds = _rotate_bbox_to_upright(value.bbox, page_size, value.angle)
+        height = _line_effective_height(value, bounds)
+        arrows = []
+        for arrow in lines:
+            if (
+                arrow is value
+                or arrow.source_index in consumed
+                or arrow.angle != value.angle
+                or arrow.semantic_type != "paragraph_title"
+                or arrow.font_signature != value.font_signature
+                or arrow.caption_start
+                or arrow.formula_candidate_only
+                or arrow.compact_formula_cluster
+                or re.fullmatch(r"[↑↓↗↘]\s*\d{0,3}", arrow.text.strip()) is None
+            ):
+                continue
+            arrow_bounds = _rotate_bbox_to_upright(arrow.bbox, page_size, arrow.angle)
+            if (
+                0.45 * height <= _line_effective_height(arrow, arrow_bounds) <= 1.05 * height
+                and 0 <= arrow_bounds[0] - bounds[2] <= 0.75 * height
+                and _bbox_axis_overlap_ratio(bounds, arrow_bounds, axis="y") >= 0.7
+            ):
+                arrows.append(arrow)
+        if len(arrows) != 1:
+            continue
+        peers = [
+            other
+            for other in lines
+            if other is not value
+            and other is not arrows[0]
+            and other.angle == value.angle
+            and other.semantic_type == "paragraph_title"
+            and other.font_signature == value.font_signature
+            and not other.caption_start
+            and 0.8 * height <= _line_effective_height(other, other.bbox) <= 1.25 * height
+            and abs(_bbox_center_y(other.bbox) - _bbox_center_y(value.bbox)) <= 0.35 * height
+            and _horizontal_bbox_gap(other.bbox, value.bbox) >= 3 * height
+        ]
+        if not peers:
+            continue
+        merged = _merge_dense_split_visual_row([value, arrows[0]], page_size)
+        merged.semantic_type = "paragraph_title"
+        merged.structural_title = merged.explicit_section_title = True
+        merged.title_band_id = value.source_index
+        merged.effective_height = merged.em_height = height
+        merged_lines.append(merged)
+        consumed.update((value.source_index, arrows[0].source_index))
+    if not consumed:
+        return lines
+    return [line for line in lines if line.source_index not in consumed] + merged_lines
 
 
 def _merge_title_resolved_visual_rows(
@@ -1367,6 +1613,7 @@ def _merge_dense_split_visual_row(
         content_parts.extend([separator, current[0].text.strip()])
 
     ordered_members = [member for member, _bbox in ordered_geometry]
+    body_typography = _bullet_body_typography_member(ordered_members)
     merged = _LineItem(
         text="".join(content_parts).strip(),
         bbox=_bbox_union_many([member.bbox for member in ordered_members]),
@@ -1392,8 +1639,10 @@ def _merge_dense_split_visual_row(
         run_index=0,
         effective_height=statistics.median(_line_effective_height(member, bbox) for member, bbox in ordered_geometry),
         em_height=statistics.median(_line_effective_height(member, bbox) for member, bbox in ordered_geometry),
-        font_signature=ordered_members[0].font_signature,
-        font_coverage=min(member.font_coverage for member in ordered_members),
+        font_signature=(body_typography or ordered_members[0]).font_signature,
+        font_coverage=body_typography.font_coverage
+        if body_typography
+        else min(member.font_coverage for member in ordered_members),
         dominant_font_weight=statistics.median(
             member.dominant_font_weight for member in ordered_members if member.dominant_font_weight is not None
         )
@@ -1408,6 +1657,7 @@ def _merge_dense_split_visual_row(
         leading_typography_width=ordered_members[0].leading_typography_width,
         paragraph_terminal=ordered_members[-1].paragraph_terminal,
         caption_start=any(member.caption_start for member in ordered_members),
+        native_math_words=frozenset(word for member in ordered_members for word in member.native_math_words),
         paragraph_formula_context=any(member.paragraph_formula_context for member in ordered_members),
         split_from_row=False,
         preserve_split_boundary=any(member.preserve_split_boundary for member in ordered_members),
@@ -1418,6 +1668,7 @@ def _merge_dense_split_visual_row(
         style_scale_repaired=any(member.style_scale_repaired for member in ordered_members),
         inline_math_regions=[region for member in ordered_members for region in member.inline_math_regions],
     )
+    _inherit_unanimous_structural_membership(merged, ordered_members)
     if merged.chars:
         _fill_native_typography(merged, page_size)
     return merged

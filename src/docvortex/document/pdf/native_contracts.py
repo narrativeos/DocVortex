@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Literal, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 from PIL import Image
 
@@ -115,6 +115,7 @@ class PDFPathInfo:
     form_depth: int
     source_index: int
     fill_rgba: tuple[int, int, int, int] | None = None
+    rectangle_bboxes: tuple[BBox, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -123,6 +124,9 @@ class PDFImageInfo:
 
     bbox: BBox
     fingerprint: str | None
+    smooth_background: bool = False
+    # 图片自身像素证明的白色/透明顶边，仅供原生布局排除相邻大标题使用。
+    blank_top_bbox: BBox | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,18 +138,76 @@ class PDFPageVectorGeometry:
 
 
 @dataclass(frozen=True, slots=True)
+class _PDFFormInfo:
+    """一个 Form 调用的自有证据；来源编号保持原字符与 Path 的遍历身份。"""
+
+    instance_id: int
+    parent_id: int | None
+    occurrence: tuple[int, ...]
+    bbox: BBox
+    declared_bbox: BBox | None
+    media_bbox: BBox
+    matrix: tuple[float, ...]
+    clip: BBox | None
+    paint_order: int
+    text_indices: frozenset[int]
+    path_indices: frozenset[int]
+    image_bboxes: tuple[BBox, ...]
+    structure_valid: bool
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class _PDFPageSnapshot:
-    """保存单次页面生命周期提取的纯 Python 数据，不持有 PDFium 子对象。"""
+    """保存单次页面提取的自有原生文本或兼容证据，不持有 PDFium 子对象。"""
 
     page_size: tuple[float, float]
     rotation: Literal[0, 90, 180, 270]
-    text_geometry: PDFPageTextGeometry
+    _text_geometry: PDFPageTextGeometry | None
     drawing_lines: list[PDFDrawingLine]
     path_infos: list[PDFPathInfo]
     image_infos: list[PDFImageInfo]
     form_bboxes: list[BBox]
     signature_bboxes: list[BBox]
     link_annotations: list[PDFLinkAnnotation]
+    native_text: Any = None
+    form_infos: tuple[_PDFFormInfo, ...] = ()
+
+    def __init__(
+        self,
+        page_size: tuple[float, float],
+        rotation: Literal[0, 90, 180, 270],
+        text_geometry: PDFPageTextGeometry | None,
+        drawing_lines: list[PDFDrawingLine],
+        path_infos: list[PDFPathInfo],
+        image_infos: list[PDFImageInfo],
+        form_bboxes: list[BBox],
+        signature_bboxes: list[BBox],
+        link_annotations: list[PDFLinkAnnotation],
+        native_text: Any = None,
+        form_infos: tuple[_PDFFormInfo, ...] = (),
+    ) -> None:
+        """保留既有text_geometry构造关键字和位置顺序，内部字段仅用于惰性兼容缓存。"""
+        for name, value in (
+            ("page_size", page_size),
+            ("rotation", rotation),
+            ("_text_geometry", text_geometry),
+            ("drawing_lines", drawing_lines),
+            ("path_infos", path_infos),
+            ("image_infos", image_infos),
+            ("form_bboxes", form_bboxes),
+            ("signature_bboxes", signature_bboxes),
+            ("link_annotations", link_annotations),
+            ("native_text", native_text),
+            ("form_infos", form_infos),
+        ):
+            object.__setattr__(self, name, value)
+
+    @property
+    def text_geometry(self) -> PDFPageTextGeometry:
+        """旧私有消费者显式访问时物化一次；Flash原生管线不提前创建兼容字符。"""
+        if self._text_geometry is None and self.native_text is not None:
+            object.__setattr__(self, "_text_geometry", self.native_text.materialize_geometry())
+        return self._text_geometry
 
 
 @dataclass

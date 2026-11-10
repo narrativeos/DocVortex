@@ -9,6 +9,7 @@ import gc
 import hashlib
 import importlib.metadata
 import json
+import os
 import platform
 import pstats
 import statistics
@@ -20,9 +21,17 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+os.environ["ORT_DISABLE_TELEMETRY"] = "1"
+import onnxruntime
+
+# 基准进程关闭与 PDF 计算无关的后台遥测，生产包的运行设置保持不变。
+onnxruntime.disable_telemetry_events()
+
 from docvortex.schema import Producer
 
 ROOT = Path(__file__).resolve().parents[2]
+from pdf_corpus import corpus_paths
+
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests" / "unittest"))
 
@@ -44,6 +53,15 @@ def _read_pdf(path: Path) -> bytes:
     return payload
 
 
+def _path_label(path: Path) -> str:
+    """为仓库内外的语料生成稳定标签，避免绝对路径无法 relative_to。"""
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(ROOT.resolve()))
+    except ValueError:
+        return str(resolved)
+
+
 def _digest(value: Any) -> str:
     """对完整 JSON 值计算稳定摘要，不忽略几何、空格或任何字段。"""
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
@@ -61,6 +79,48 @@ def _predict(payload: bytes) -> list[list[dict[str, Any]]]:
         return PdfModel().predict(document)
 
 
+def _predict_with_timings(payload: bytes) -> tuple[list[list[dict[str, Any]]], dict[str, float]]:
+    """在不改动生产接口的前提下记录表格检测两个主要阶段的耗时。"""
+    from unittest.mock import patch
+
+    from docvortex.analyzers.native.pdf import pipeline, table_detection, table_rules
+
+    timings = {"detect_table_candidates_seconds": 0.0, "build_rule_table_candidates_seconds": 0.0}
+    original_build = table_rules._build_rule_table_candidates
+    original_detect = table_detection._detect_table_candidates
+
+    def timed_build(*args: Any, **kwargs: Any) -> Any:
+        started = time.perf_counter()
+        try:
+            return original_build(*args, **kwargs)
+        finally:
+            timings["build_rule_table_candidates_seconds"] += time.perf_counter() - started
+
+    def timed_detect(*args: Any, **kwargs: Any) -> Any:
+        started = time.perf_counter()
+        try:
+            return original_detect(*args, **kwargs)
+        finally:
+            timings["detect_table_candidates_seconds"] += time.perf_counter() - started
+
+    with (
+        patch.object(table_rules, "_build_rule_table_candidates", timed_build),
+        patch.object(
+            table_detection,
+            "_build_rule_table_candidates",
+            timed_build,
+        ),
+        patch.object(table_detection, "_detect_table_candidates", timed_detect),
+        patch.object(
+            pipeline,
+            "_detect_table_candidates",
+            timed_detect,
+        ),
+    ):
+        pages = _predict(payload)
+    return pages, timings
+
+
 def _worker(path: Path, destination: Path, runs: int, profile: bool) -> None:
     """隔离一份文档的计时、完整输出和进程峰值内存，避免其它文档污染 RSS。"""
     import resource
@@ -69,8 +129,11 @@ def _worker(path: Path, destination: Path, runs: int, profile: bool) -> None:
 
     logger.disable("docvortex")
     payload = _read_pdf(path)
+    first_seconds = None
     if runs:
+        started = time.perf_counter()
         _predict(payload)
+        first_seconds = time.perf_counter() - started
     durations = []
     expected_digest = None
     for _ in range(max(1, runs)):
@@ -83,8 +146,32 @@ def _worker(path: Path, destination: Path, runs: int, profile: bool) -> None:
             raise AssertionError(f"Non-deterministic model-list: {path}")
         expected_digest = digest
         del pages
+        _write_json(
+            destination / "progress.json",
+            {
+                "path": str(path.resolve()),
+                "source_sha256": hashlib.sha256(payload).hexdigest(),
+                "status": "timing",
+                "first_seconds": first_seconds,
+                "seconds": durations,
+                "completed_runs": len(durations),
+                "model_list_sha256": expected_digest,
+            },
+        )
     peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    pages = _predict(payload)
+    _write_json(
+        destination / "progress.json",
+        {
+            "path": str(path.resolve()),
+            "source_sha256": hashlib.sha256(payload).hexdigest(),
+            "status": "stage_diagnostics",
+            "first_seconds": first_seconds,
+            "seconds": durations,
+            "completed_runs": len(durations),
+            "model_list_sha256": expected_digest,
+        },
+    )
+    pages, stage_timings = _predict_with_timings(payload)
     middle = model_json_to_middle_json(
         ModelJson(
             pages=deepcopy(pages),
@@ -95,7 +182,7 @@ def _worker(path: Path, destination: Path, runs: int, profile: bool) -> None:
     output = {"model_list": pages, "middle_json": middle}
     _write_json(destination / "output.json", output)
     result = {
-        "path": str(path.relative_to(ROOT)),
+        "path": _path_label(path),
         "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         "runtime": asdict(initialize_pdfium_runtime()),
         "pages": len(pages),
@@ -103,8 +190,11 @@ def _worker(path: Path, destination: Path, runs: int, profile: bool) -> None:
         "page_fingerprints": [_page_fingerprint(page) for page in pages],
         "bbox_fingerprints": [_page_bbox_fingerprint(page) for page in pages],
         "seconds": durations,
+        "first_seconds": first_seconds,
+        "onnxruntime_telemetry": "disabled_before_import",
         "median_seconds": statistics.median(durations),
         "peak_rss_bytes": peak_rss * (1024 if sys.platform != "darwin" else 1),
+        **stage_timings,
     }
     del pages, middle, output
     if profile:
@@ -116,7 +206,7 @@ def _worker(path: Path, destination: Path, runs: int, profile: bool) -> None:
         stats = pstats.Stats(profiler)
         result["profile"] = [
             {
-                "file": "docvortex/" + Path(filename).relative_to(package_root).as_posix(),
+                "file": "docvortex/" + Path(filename).resolve().relative_to(package_root).as_posix(),
                 "line": line,
                 "function": name,
                 "calls": values[1],
@@ -124,8 +214,13 @@ def _worker(path: Path, destination: Path, runs: int, profile: bool) -> None:
                 "cumulative_seconds": values[3],
             }
             for (filename, line, name), values in stats.stats.items()
-            if "/docvortex/analyzers/native/pdf/" in filename
+            if "/docvortex/analyzers/native/pdf/" in filename or "/docvortex/document/pdf/" in filename
         ]
+    from docvortex._compute_backend import backend_info
+    from docvortex.version import __version__
+
+    result["compute"] = backend_info()
+    result["source_version"] = __version__
     _write_json(destination / "result.json", result)
 
 
@@ -165,6 +260,7 @@ def main() -> None:
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--runs", type=int, default=5, help="预热一次后计时次数；0 只运行功能校验")
     parser.add_argument("--path", action="append", default=[])
+    parser.add_argument("--corpus", choices=("demo", "all"), default="all")
     parser.add_argument("--profile", action="store_true", help="额外运行剖析；不计入耗时或 RSS 指标")
     parser.add_argument("--worker", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -176,18 +272,18 @@ def main() -> None:
     if (args.output / "report.json").exists():
         parser.error("output already contains a report; choose a new directory")
     manifest = json.loads((ROOT / "tests/fixtures/flash_layout_geometry_manifest.json").read_text(encoding="utf-8"))
-    paths = args.path or [
-        *(item["path"] for item in manifest["documents"]),
-        *(str(path.relative_to(ROOT)) for path in sorted((ROOT / "tests/unittest/pdfs/native_pdf_tables").glob("*.pdf"))),
-    ]
+    paths = args.path or corpus_paths(args.corpus)
     results = []
     for index, relative in enumerate(dict.fromkeys(paths)):
         destination = args.output.resolve() / f"{index:02d}-{Path(relative).stem}"
+        input_path = Path(relative).expanduser()
+        if not input_path.is_absolute():
+            input_path = ROOT / input_path
         command = [
             sys.executable,
             str(Path(__file__).resolve()),
             "--worker",
-            str(ROOT / relative),
+            str(input_path),
             "--output",
             str(destination),
             "--runs",

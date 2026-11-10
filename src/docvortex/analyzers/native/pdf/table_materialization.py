@@ -50,6 +50,9 @@ def _recover_native_table_html(
     rectangles: tuple[NativeTableRectangle, ...] | None = None,
     tight_bboxes: dict[int, BBox] | None = None,
     origins: dict[int, tuple[float, float]] | None = None,
+    *,
+    _owned_script_inputs: tuple[Any, dict[int, int]] | None = None,
+    preserve_font_styles: bool = False,
 ) -> str:
     """使用共享原生字符与绘图原语恢复高置信表格 HTML。"""
 
@@ -61,8 +64,41 @@ def _recover_native_table_html(
         drawing_lines=(drawing_lines if drawing_lines is not None else coerce_native_table_rules(source.drawing_lines)),
         rectangles=(rectangles if rectangles is not None else coerce_native_table_rectangles(source.path_infos)),
     )
-    recovered = recover_table_result(table_input, tight_bboxes or {}, origins or {})
+    recovered = recover_table_result(
+        table_input,
+        tight_bboxes or {},
+        origins or {},
+        _owned_script_inputs=_owned_script_inputs,
+        preserve_font_styles=preserve_font_styles,
+    )
     return recovered[0] if recovered is not None else ""
+
+
+def _overlapping_table_character_repairs(source: _PageSource) -> dict[int, BBox]:
+    """同字体汉字的实际墨迹和字宽证明宽松框异常时，按原生基线恢复聚行尺度。"""
+    groups = {}
+    for char in source.chars:
+        font = char.get("font") or {}
+        groups.setdefault((font.get("name"), font.get("weight"), font.get("flags")), []).append(char)
+    repairs = {}
+    for chars in groups.values():
+        anchors = [
+            char
+            for char in chars
+            if re.fullmatch(r"[\u4e00-\u9fff]", char.get("char", "")) and char.get("tight_bbox") and char.get("origin")
+        ]
+        if len(anchors) < 20:
+            continue
+        em = statistics.median(char["bbox"][2] - char["bbox"][0] for char in anchors)
+        loose = statistics.median(char["bbox"][3] - char["bbox"][1] for char in anchors)
+        ink = statistics.median(char["tight_bbox"][3] - char["tight_bbox"][1] for char in anchors)
+        if em <= 0 or loose < 2.2 * em or not 0.5 * em <= ink <= 1.4 * em:
+            continue
+        for char in chars:
+            box, origin = char.get("bbox"), char.get("origin")
+            if box and origin and char.get("char_idx") is not None and box[3] - box[1] >= 2 * em:
+                repairs[char["char_idx"]] = (box[0], origin[1] - 0.85 * em, box[2], origin[1] + 0.15 * em)
+    return repairs
 
 
 def _materialize_table_blocks(
@@ -71,6 +107,8 @@ def _materialize_table_blocks(
     *,
     tight_bboxes: dict[int, BBox] | None = None,
     origins: dict[int, tuple[float, float]] | None = None,
+    calibrated_char_bboxes: dict[int, BBox] | None = None,
+    _owned_script_inputs: tuple[Any, dict[int, int]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[int]]:
     """原子物化表体及其独立注释，仅认领整组成功输出的文本行。"""
 
@@ -78,7 +116,16 @@ def _materialize_table_blocks(
     annotation_blocks: list[dict[str, Any]] = []
     accepted_candidate_bboxes: list[BBox] = []
     claimed: set[int] = set()
-    native_chars = tuple(source.chars)
+    # 只复制已有强证据校准的字符，保持原始来源记录及字符身份不变；未校准文档继续原路径。
+    calibrated = {**_overlapping_table_character_repairs(source), **(calibrated_char_bboxes or {})}
+    native_chars = (
+        tuple(
+            dict(char, bbox=calibrated[char["char_idx"]]) if char.get("char_idx") in calibrated else char
+            for char in source.chars
+        )
+        if calibrated
+        else tuple(source.chars)
+    )
     native_rules = coerce_native_table_rules(source.drawing_lines)
     native_rectangles = coerce_native_table_rectangles(source.path_infos)
     for candidate in sorted(candidates, key=lambda item: item.score, reverse=True):
@@ -105,10 +152,16 @@ def _materialize_table_blocks(
                 body_bbox,
                 candidate.angle,
                 native_chars,
-                native_rules,
-                native_rectangles,
+                (() if candidate.inferred_grid_authoritative else native_rules)
+                + coerce_native_table_rules(candidate.inferred_grid),
+                () if candidate.inferred_grid_authoritative else native_rectangles,
                 tight_bboxes,
                 origins,
+                _owned_script_inputs=_owned_script_inputs,
+                preserve_font_styles=candidate.preserve_inline_font_styles
+                or any(
+                    _point_in_bbox(((box[0] + box[2]) / 2, (box[1] + box[3]) / 2), body_bbox) for box in calibrated.values()
+                ),
             )
         except Exception as exc:
             logger.warning(
@@ -541,6 +594,9 @@ def recover_table_result(
     table_input: NativeTableInput,
     tight_bboxes: dict[int, BBox],
     origins: dict[int, tuple[float, float]],
+    *,
+    _owned_script_inputs: tuple[Any, dict[int, int]] | None = None,
+    preserve_font_styles: bool = False,
 ) -> tuple[str, NativeTableResult] | None:
     """统一表格恢复和上下标物化，保留调用方接受或回退的决策权。"""
     try:
@@ -549,5 +605,12 @@ def recover_table_result(
         raise PDFTableRecoveryError(str(error)) from error
     if result is None:
         return None
-    content = render_native_table_html_with_scripts(result, table_input, tight_bboxes, origins)
+    content = render_native_table_html_with_scripts(
+        result,
+        table_input,
+        tight_bboxes,
+        origins,
+        _owned_script_inputs=_owned_script_inputs,
+        preserve_font_styles=preserve_font_styles,
+    )
     return content, result

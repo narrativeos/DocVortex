@@ -438,9 +438,15 @@ def test_pdf_document_methods_keep_page_access_inside_pdfium_lock(monkeypatch: p
             events.append(f"doc.close:{lock.depth}")
 
     def fake_get_chars(
-        textpage: _FakeTextPage, page_bbox: list[float], page_rotation: int, *, include_geometry: bool = False
+        textpage: _FakeTextPage,
+        page_bbox: list[float],
+        page_rotation: int,
+        *,
+        include_geometry: bool = False,
+        unicode_fallback: Callable[[list[int]], dict[int, int]] | None = None,
     ) -> list[dict[str, Any]]:
         """记录文本抽取时的锁深度，避免依赖旧模块级 get_page_chars 钩子。"""
+        assert callable(unicode_fallback)
         events.append(f"get_chars:{lock.depth}:{page_bbox}:{page_rotation}")
         return [
             {
@@ -744,22 +750,18 @@ def test_get_page_drawing_lines_extracts_forms_filled_rectangles_and_merges_segm
         lines = doc.get_page_drawing_lines(0)
 
     assert [line.orientation for line in lines] == ["horizontal"] * 4
-    assert [line.start for line in lines] == pytest.approx(
-        [
-            (10.0, 20.0),
-            (10.0, 40.0),
-            (10.0, 60.25),
-            (30.0, 100.0),
-        ]
-    )
-    assert [line.end for line in lines] == pytest.approx(
-        [
-            (90.0, 20.0),
-            (90.0, 40.0),
-            (90.0, 60.25),
-            (70.0, 100.0),
-        ]
-    )
+    assert [line.start for line in lines] == [
+        pytest.approx((10.0, 20.0)),
+        pytest.approx((10.0, 40.0)),
+        pytest.approx((10.0, 60.25)),
+        pytest.approx((30.0, 100.0)),
+    ]
+    assert [line.end for line in lines] == [
+        pytest.approx((90.0, 20.0)),
+        pytest.approx((90.0, 40.0)),
+        pytest.approx((90.0, 60.25)),
+        pytest.approx((70.0, 100.0)),
+    ]
     assert [line.width for line in lines] == pytest.approx([1.0, 1.0, 0.5, 1.0])
     assert lines[2].bbox == pytest.approx((10.0, 60.0, 90.0, 60.5))
 
@@ -847,13 +849,11 @@ def test_get_page_image_bboxes_applies_forms_crop_box_rotation_and_clipping() ->
         image_bboxes = doc.get_page_image_bboxes(0)
 
     assert page_size == pytest.approx((180.0, 90.0))
-    assert image_bboxes == pytest.approx(
-        [
-            (160.0, 0.0, 180.0, 15.0),
-            (10.0, 5.0, 50.0, 35.0),
-            (76.0, 47.0, 88.0, 53.0),
-        ]
-    )
+    assert image_bboxes == [
+        pytest.approx((160.0, 0.0, 180.0, 15.0)),
+        pytest.approx((10.0, 5.0, 50.0, 35.0)),
+        pytest.approx((76.0, 47.0, 88.0, 53.0)),
+    ]
 
 
 def test_get_page_image_infos_preserves_bboxes_and_fingerprints_reused_images() -> None:
@@ -862,13 +862,11 @@ def test_get_page_image_infos_preserves_bboxes_and_fingerprints_reused_images() 
     with pdf_document.PDFDocument(_build_rotated_cropped_image_pdf()) as doc:
         image_infos = doc.get_page_image_infos(0)
 
-    assert [info.bbox for info in image_infos] == pytest.approx(
-        [
-            (160.0, 0.0, 180.0, 15.0),
-            (10.0, 5.0, 50.0, 35.0),
-            (76.0, 47.0, 88.0, 53.0),
-        ]
-    )
+    assert [info.bbox for info in image_infos] == [
+        pytest.approx((160.0, 0.0, 180.0, 15.0)),
+        pytest.approx((10.0, 5.0, 50.0, 35.0)),
+        pytest.approx((76.0, 47.0, 88.0, 53.0)),
+    ]
     assert len({info.fingerprint for info in image_infos}) == 1
     assert image_infos[0].fingerprint is not None
 
@@ -910,7 +908,7 @@ def test_get_page_form_bboxes_reads_root_forms_and_nested_content_bounds() -> No
     with pdf_document.PDFDocument(_build_drawing_pdf()) as doc:
         form_bboxes = doc.get_page_form_bboxes(0)
 
-    assert form_bboxes == pytest.approx([(30.0, 99.0, 70.0, 100.0)])
+    assert form_bboxes == [pytest.approx((30.0, 99.0, 70.0, 100.0))]
 
 
 def test_get_page_form_bboxes_applies_crop_box_rotation_and_clipping() -> None:
@@ -920,7 +918,7 @@ def test_get_page_form_bboxes_applies_crop_box_rotation_and_clipping() -> None:
         form_bboxes = doc.get_page_form_bboxes(0)
 
     assert page_size == pytest.approx((180.0, 90.0))
-    assert form_bboxes == pytest.approx([(76.0, 47.0, 88.0, 53.0)])
+    assert form_bboxes == [pytest.approx((76.0, 47.0, 88.0, 53.0))]
 
 
 def test_get_page_signature_bboxes_filters_visibility_and_applies_page_geometry() -> None:
@@ -931,12 +929,10 @@ def test_get_page_signature_bboxes_filters_visibility_and_applies_page_geometry(
         signature_bboxes = doc.get_page_signature_bboxes(0)
 
     assert page_size == pytest.approx((180.0, 90.0))
-    assert signature_bboxes == pytest.approx(
-        [
-            (160.0, 0.0, 180.0, 15.0),
-            (10.0, 5.0, 50.0, 35.0),
-        ]
-    )
+    assert signature_bboxes == [
+        pytest.approx((160.0, 0.0, 180.0, 15.0)),
+        pytest.approx((10.0, 5.0, 50.0, 35.0)),
+    ]
 
 
 def test_pdf_document_extracts_safe_external_link_annotations() -> None:
@@ -1083,49 +1079,44 @@ def test_extract_page_form_bboxes_skips_one_bad_object(monkeypatch: pytest.Monke
     ) == [(10.0, 20.0, 30.0, 40.0)]
 
 
+def _skip_first_native_path(monkeypatch):
+    """用合法 ctypes ABI 让首条 Path 报告无可读段，验证实际 Rust 遍历的逐对象隔离。"""
+    import ctypes
+
+    getter = pdf_document.pdfium_c.FPDFPath_CountSegments
+    first = []
+    calls = []
+
+    def count_segments(obj):
+        """只损坏首次遇到的对象，后续查询继续调用同库 PDFium。"""
+        address = ctypes.cast(obj, ctypes.c_void_p).value
+        if not first:
+            first.append(address)
+        calls.append(address)
+        return 0 if address == first[0] else getter(obj)
+
+    factory = ctypes.WINFUNCTYPE if hasattr(ctypes, "WINFUNCTYPE") else ctypes.CFUNCTYPE
+    callback = factory(getter.restype, *getter.argtypes)(count_segments)
+    monkeypatch.setattr(pdf_document.pdfium_c, "FPDFPath_CountSegments", callback)
+    return calls
+
+
 def test_get_page_drawing_lines_skips_one_bad_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    """验证单个 Path 解析异常不会丢失同页其他有效绘图线。"""
-    original_extract = pdf_document._extract_path_drawing_lines
-    call_count = 0
-
-    def flaky_extract(*args: Any, **kwargs: Any) -> list[pdf_document.PDFDrawingLine]:
-        """仅让首个 Path 失败，后续对象仍调用真实实现。"""
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            raise RuntimeError("broken path")
-        return original_extract(*args, **kwargs)
-
-    monkeypatch.setattr(native_objects, "_extract_path_drawing_lines", flaky_extract)
+    """首条原生 Path 无有效段时，其余页面绘图线仍完整保留。"""
+    calls = _skip_first_native_path(monkeypatch)
     with pdf_document.PDFDocument(_build_drawing_pdf()) as doc:
         lines = doc.get_page_drawing_lines(0)
-
-    assert call_count >= 5
+    assert len(calls) >= 5
     assert len(lines) == 3
-    assert all(line.start[1] != pytest.approx(20.0) for line in lines)
     assert [line.start[1] for line in lines] == pytest.approx([40.0, 60.25, 100.0])
 
 
 def test_get_page_path_infos_skips_one_bad_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    """验证单个 Path 信息解析失败不会丢失同页其他有效对象。"""
-
-    original_extract = pdf_document._path_info_from_object
-    call_count = 0
-
-    def flaky_extract(*args: Any, **kwargs: Any) -> pdf_document.PDFPathInfo | None:
-        """仅让首个 Path 失败，后续对象仍调用真实实现。"""
-
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            raise RuntimeError("broken path")
-        return original_extract(*args, **kwargs)
-
-    monkeypatch.setattr(native_objects, "_path_info_from_object", flaky_extract)
+    """首条原生 Path 无有效段时，其他路径摘要保留原来源编号。"""
+    calls = _skip_first_native_path(monkeypatch)
     with pdf_document.PDFDocument(_build_drawing_pdf()) as doc:
         path_infos = doc.get_page_path_infos(0)
-
-    assert call_count >= 8
+    assert len(calls) >= 8
     assert len(path_infos) == 6
     assert all(item.source_index != 0 for item in path_infos)
 
@@ -1198,18 +1189,21 @@ def test_native_page_snapshot_opens_once_and_closes_after_failure(monkeypatch: p
 
 
 def test_native_page_snapshot_decodes_each_path_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    """同一 Path 解码由绘图线和路径信息共享，避免独立接口的重复工作。"""
+    """通过真实 ABI 统计段读取，联合原生快照避免单独查询的重复解码。"""
+    import ctypes
 
-    counts: list[object] = []
-    original = pdf_document._read_raw_path_subpaths
+    counts = []
+    original = pdf_document.pdfium_c.FPDFPath_GetPathSegment
 
-    def record_decode(raw_object: Any) -> list[pdf_document._PathSubpath]:
-        """统计真实 Path 解码次数，不替换解码结果。"""
+    def record_decode(raw_object, index):
+        """返回原始段地址并记录读取，保持同库句柄和函数签名。"""
+        counts.append((ctypes.cast(raw_object, ctypes.c_void_p).value, index))
+        return ctypes.cast(original(raw_object, index), ctypes.c_void_p).value
 
-        counts.append(raw_object)
-        return original(raw_object)
-
-    monkeypatch.setattr(native_objects, "_read_raw_path_subpaths", record_decode)
+    factory = ctypes.WINFUNCTYPE if hasattr(ctypes, "WINFUNCTYPE") else ctypes.CFUNCTYPE
+    callback = factory(ctypes.c_void_p, *original.argtypes)(record_decode)
+    callback.restype = original.restype
+    monkeypatch.setattr(pdf_document.pdfium_c, "FPDFPath_GetPathSegment", callback)
     with pdf_document.PDFDocument(_build_drawing_pdf()) as document:
         document.get_page_drawing_lines(0)
         document.get_page_path_infos(0)
@@ -1218,6 +1212,9 @@ def test_native_page_snapshot_decodes_each_path_once(monkeypatch: pytest.MonkeyP
         document._extract_native_page(0)
         shared_count = len(counts)
         with document._open_page(0) as page:
-            expected_count = len(list(pdf_document._iter_raw_path_objects_with_depth(page)))
+            expected_count = sum(
+                pdf_document.pdfium_c.FPDFPath_CountSegments(item[0])
+                for item in pdf_document._iter_raw_path_objects_with_depth(page)
+            )
         assert shared_count == expected_count
         assert shared_count < separate_count

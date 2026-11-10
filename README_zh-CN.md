@@ -8,12 +8,14 @@
 
 [![PyPI](https://img.shields.io/pypi/v/docvortex?color=008cff)](https://pypi.org/project/docvortex/)
 [![Python](https://img.shields.io/pypi/pyversions/docvortex)](https://pypi.org/project/docvortex/)
+[![Downloads](https://static.pepy.tech/badge/docvortex)](https://pepy.tech/project/docvortex)
+[![Monthly Downloads](https://static.pepy.tech/badge/docvortex/month)](https://pepy.tech/project/docvortex)
 [![CI](https://github.com/myhloli/DocVortex/actions/workflows/ci.yml/badge.svg)](https://github.com/myhloli/DocVortex/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/myhloli/DocVortex/blob/main/LICENSE.md)
 
 [English](https://github.com/myhloli/DocVortex/blob/main/README.md) · **简体中文**
 
-[快速开始](#快速开始) · [格式支持](#格式支持) · [文档导航](#文档导航)
+[性能提升](#pdf-性能) · [快速开始](#快速开始) · [格式支持](#格式支持) · [文档导航](#文档导航)
 
 </div>
 
@@ -23,18 +25,42 @@ DocVortex 是一个独立的 Python 文档解析与转换引擎。
 它读取文档中的原生文字与结构，整理为统一的中间表示，
 再按工作流需要导出为不同格式。
 
-- **多格式输入** — 支持文本 PDF、Office、OpenDocument、EPUB、HTML、OFD、CSV 和 TSV。
+- **多格式输入** — 支持原生文字 PDF、Office、OpenDocument、EPUB、HTML、OFD、CSV 和 TSV。
 - **一次解析，多种导出** — 同一份结果可生成 Markdown、HTML、LaTeX、DOCX、EPUB、PDF 和结构化 JSON。
 - **结果可携带** — 将文档结构与图像素材保存为 Bundle，离开源文件也能继续导出。
 - **API 可组合** — 直接调用完整流程，或分别接入分析、后处理和渲染阶段。
 
 原生解析无需 OCR 或 VLM 推理服务。您可通过 CLI 或 Python SDK 便捷的使用 DocVortex。
 
+DocVortex 不下载模型，也不执行 PDF OCR。遇到需要 OCR 的文档时，会返回 `pdf_ocr_unsupported`，提示下载并安装 [MinerU](https://github.com/opendatalab/MinerU) 处理。
+
 ![DocVortex 转换流程：原生文档经过统一中间表示，导出为 Markdown、HTML、LaTeX、DOCX、EPUB、PDF 或结构化 JSON。](https://gcore.jsdelivr.net/gh/myhloli/DocVortex@main/docs/images/docvortex-overview.jpg)
+
+## PDF 性能
+
+**正式 0.5.10 使用 Rust 加速，在所测语料上，公开解析速度达到 0.4.25 的 2.93 倍。**
+
+| 处理链路 | 0.4.25 python | 0.5.10 rust | 加速倍数 | 耗时降低 | 峰值 RSS 降低 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| DocVortex 公开 `parse()` | 42.36 s | 14.48 s | **2.93×** | **65.82%** | **31.17%** |
+| MinerU Flash | 44.50 s | 14.44 s | **3.08×** | **67.55%** | **29.84%** |
+| MinerU 共享 PDF 处理 | 76.28 s | 12.85 s | **5.94×** | **83.16%** | **35.65%** |
+
+同机热运行对比，覆盖 32 份 PDF／299 页（Flash 为 31 份）。0.4.25 沿用既有测量结果；0.5.10 逐文档预热一次、计时五次，进行三轮平衡配对，取三轮中位数的中位数后求和。RSS 降幅为逐文档进程树峰值 RSS 降幅的中位数。MinerU 数据包含双仓优化收益；共享路径不含模型计算，剔除极端密集表格样本后为 **2.87×**。
+
+[非 PDF 优化总报告](https://github.com/myhloli/DocVortex/blob/main/docs/optimization-final-report-2026-10-25.md)记录了共同原始基线对照、逐格式耗时、内存复核和剩余热点。
 
 ## 快速开始
 
-需要 **Python 3.10–3.14**。
+需要 **启用 GIL 的 CPython 3.11–3.14**、**pypdfium2 >=5.13.0,<6** 和 **ONNX Runtime 1.24.4 或更新版本**（Windows x64 使用 DirectML）。
+macOS 安装需要 **Apple Silicon 和 macOS 14 或更新版本**；从 0.6.0 起不再支持 Intel Mac。
+
+0.6 保留 Python SDK 和 CLI，运行时必须使用随包提供的 Rust native 扩展。
+发行物仅包含 Linux x86_64/aarch64（glibc 2.28+）、Windows x86_64/ARM64 和 macOS arm64 的 ABI3 wheel，
+不再发布纯 Python 兼容 wheel 或 sdist；不支持 PyPy 和 free-threaded Python。
+从 0.6.1 起忽略 `DOCVORTEX_BUILD_NATIVE`、`DOCVORTEX_COMPUTE_BACKEND` 环境变量，设置任何值均不影响构建或运行。
+0.6.0 包仍会拒绝这两个变量。
+需要旧平台或兼容包的用户可在迁移期间固定使用 `docvortex<0.6`。
 
 ### 安装
 
@@ -73,17 +99,19 @@ result.export("output/report.docx", output_format="docx")
 
 ## 格式支持
 
-### 原生输入 · 15 种格式
+### 原生输入 · 20 种格式
 
-| 文档类别 | 格式 |
+| 文档类别 | 文件后缀 |
 | --- | --- |
-| 含原生文字的 PDF | PDF |
-| Word 与富文本 | DOC, DOCX, RTF |
-| 演示文稿 | PPT, PPTX |
-| 电子表格 | XLS, XLSX, CSV, TSV |
-| OpenDocument | ODT, ODS, ODP |
-| 电子书与网页文档 | EPUB, HTML |
-| 开放版式文档 | OFD |
+| 含原生文字或扫描页面的 PDF | `.pdf` |
+| Word 与富文本 | `.doc`, `.docx`, `.rtf` |
+| 演示文稿 | `.ppt`, `.pptx` |
+| 电子表格 | `.xls`, `.xlsx`, `.csv`, `.tsv` |
+| OpenDocument | `.odt`, `.ods`, `.odp` |
+| 电子书 | `.epub` |
+| 网页文档 | `.html`, `.htm`, `.shtml` |
+| 网页归档 | `.mhtml`, `.mht` |
+| 开放版式文档 | `.ofd` |
 
 ### 输出 · 7 种格式
 
@@ -125,8 +153,11 @@ restored.export("output/report.epub", output_format="epub")
 
 ## 选择适合的处理方式
 
-- **文本 PDF：** 原生解析利用文档已有的文字与结构。需要 OCR 的扫描页面应交给外部 OCR 或推理服务。
-- **PDF 分类：** `docvortex classify report.pdf` 返回 `txt` 或 `ocr`。分类需要显式调用，不会启动推理；解析也不会自动切换后端。
+- **PDF 结构解析**默认使用 `pdf_structure="auto"`，优先利用 Tagged PDF 的语义和阅读顺序，未覆盖内容交给 Flash 规则。`pdf_structure="off"` 选择几何解析，CLI 对应 `--pdf-structure auto|off`。原始角色和块关联保存在 `docvortex_pdf_structure` 扩展中。[结构解析用法](docs/USAGE.md#tagged-pdf-and-pdfua-native-parsing)
+- **PDF 解析模式**默认使用 `parse_mode="auto"`，先接受足够的结构证据，再对需要判断的选定页面整体分类。`txt` 使用原生解析，`ocr` 返回 `pdf_ocr_unsupported` 和 MinerU 下载地址。`parse_mode="txt"` 强制原生解析。CLI 使用 `--parse-mode auto|txt|ocr`，显式模式适用于 PDF。
+- **PDF OCR：** `parse_mode="ocr"` 和 `--parse-mode ocr` 仅保留为兼容性入口，对 PDF 始终返回 `pdf_ocr_unsupported`。需要 OCR 时请下载并安装 [MinerU](https://github.com/opendatalab/MinerU)。DocVortex 不会自动安装或调用 MinerU。
+- **混合 PDF：** auto 模式不逐页分类或切换后端。整体判为 `txt` 时继续原生解析；其中扫描页需要 OCR 时，请使用 MinerU。
+- **PDF 分类：** `docvortex classify report.pdf` 返回 `txt` 或 `ocr`，不推理、不联网。元数据提取及底层 `PdfModel.predict()` 原生文字入口也保持离线。
 - **PDF 导出：** 具有页面几何的 PDF 来源默认按原始块布局还原，正文可选择，表格优先使用可选择文字的 HTML 结构表，图表保留区域图；其他来源和旧结果继续语义重排。可通过 `--pdf-layout original|reflow` 显式选择，字体、换行与绘图指令不保证无损复现。详见 [PDF 布局选项](docs/USAGE.md#pdf-output-layout)。
 
 ## 文档导航
@@ -140,9 +171,13 @@ restored.export("output/report.epub", output_format="epub")
 | [JSON 协议](https://github.com/myhloli/DocVortex/blob/main/docs/JSON_PROTOCOL.md) | 文档结构、扩展字段与协议迁移 |
 | [HTML 协议](https://github.com/myhloli/DocVortex/blob/main/docs/HTML_PROTOCOL.md) | 语义标记与往返转换 |
 | [公共 SDK 与迁移](https://github.com/myhloli/DocVortex/blob/main/docs/sdk-0.4.md) | 公开集成边界与 0.4 升级说明 |
+| [0.6 原生后端迁移](docs/native-only-0.6.md) | 安装边界、旧配置退役与本地验收记录 |
 | [渲染职责](https://github.com/myhloli/DocVortex/blob/main/docs/RENDER_OWNERSHIP.md) | DocVortex 导出与 MinerU 专属渲染器 |
 
 ## 开发
+
+请先阅读[仓库架构](docs/ARCHITECTURE.md)，了解目录职责、Python/Rust 边界及原生扩展的开发与验证命令。
+源码构建需要 `rust-toolchain.toml` 指定的 Rust 工具链和平台 C/C++ 链接器。
 
 在本地仓库目录中运行：
 
@@ -152,7 +187,7 @@ uv pip install -e ".[test,dev]"
 uv run --no-project python -m pytest -q
 uv run --no-project ruff check src
 uv run --no-project ruff format --check src
-uv build
+uv build --wheel
 ```
 
 欢迎反馈问题和贡献代码。报告解析问题时，请在

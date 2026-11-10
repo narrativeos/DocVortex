@@ -7,10 +7,13 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from ..equation.image import OfficeImageEquationDecoder
 from ..equation.ooxml import OoxmlEquationDecoder
+from ..errors import LegacyOfficeResourceLimitError
 from ..streams import read_stream_bytes_from_start, rewind_stream
 from .package_normalizer import normalize_pptx_package
 from ..._shared.xycut import sort_entries
 from .....schema import BlockType
+from .....errors import DocumentError
+from .....foundation.ooxml_zip import validate_ooxml_package
 
 # PPTX_XYCUT_BETA: Final = 0.7
 # PPTX 标题占位符角色仅用于单页内部归一化，返回 model_output 前必须清理。
@@ -45,6 +48,10 @@ from .text_styles import _PptxTextStyles
 from .lists import _PptxLists
 from .titles import _PptxTitles
 
+# python-pptx 默认模板幻灯片尺寸（10 × 7.5 英寸，EMU），用于缺 p:sldSz 的包。
+DEFAULT_SLIDE_WIDTH_EMU = 9144000
+DEFAULT_SLIDE_HEIGHT_EMU = 6858000
+
 
 class PptxConverter(_PptxResources, _PptxShapes, _PptxTextStyles, _PptxLists, _PptxTitles):
     """编排 PPTX 包读取、逐页遍历、重试及职责处理。"""
@@ -63,10 +70,13 @@ class PptxConverter(_PptxResources, _PptxShapes, _PptxTextStyles, _PptxLists, _P
         self,
         file_stream: BinaryIO,
     ):
+        """解析 PPTX；资源异常直接传播，包兼容异常才进入规范化重试。"""
         if rewind_stream(file_stream):
             try:
                 self._convert_package_stream(file_stream)
                 return
+            except (DocumentError, LegacyOfficeResourceLimitError, MemoryError):
+                raise
             except Exception as exc:
                 file_bytes = read_stream_bytes_from_start(file_stream)
                 self._retry_convert_package_bytes_after_normalization(file_bytes, exc)
@@ -75,6 +85,8 @@ class PptxConverter(_PptxResources, _PptxShapes, _PptxTextStyles, _PptxLists, _P
         file_bytes = file_stream.read()
         try:
             self._convert_package_bytes(file_bytes)
+        except (DocumentError, LegacyOfficeResourceLimitError, MemoryError):
+            raise
         except Exception as exc:
             self._retry_convert_package_bytes_after_normalization(file_bytes, exc)
 
@@ -98,6 +110,7 @@ class PptxConverter(_PptxResources, _PptxShapes, _PptxTextStyles, _PptxLists, _P
         """直接使用可复位的 PPTX 流解析正常路径，避免提前复制完整包字节。"""
         self._reset_state()
         rewind_stream(file_stream)
+        validate_ooxml_package(file_stream)
         self.file_stream = file_stream
         self.pptx_obj = Presentation(self.file_stream)
         self.pages.append(self.cur_page)
@@ -119,8 +132,9 @@ class PptxConverter(_PptxResources, _PptxShapes, _PptxTextStyles, _PptxLists, _P
         self._convert_package_bytes(normalized_bytes)
 
     def _walk_linear(self, pptx_obj: presentation.Presentation):
-        slide_width = int(pptx_obj.slide_width)
-        slide_height = int(pptx_obj.slide_height)
+        # 缺 p:sldSz 的非标准包 slide_width/height 为 None，按 python-pptx 默认模板尺寸回退。
+        slide_width = int(pptx_obj.slide_width or DEFAULT_SLIDE_WIDTH_EMU)
+        slide_height = int(pptx_obj.slide_height or DEFAULT_SLIDE_HEIGHT_EMU)
         has_visible_content_slide = False
 
         # 遍历每一张幻灯片

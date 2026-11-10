@@ -1,0 +1,389 @@
+"""对原生内核作独立差分，覆盖几何阈值、Unicode 和公开对象只读契约。"""
+
+import pickle
+import random
+from pathlib import Path
+
+import pytest
+
+
+from docvortex._compute_backend import get_native
+from docvortex.analyzers.native.pdf import _script_geometry as scripts
+from docvortex.document.pdf import PDFDocument
+from docvortex.document.pdf.text import Bbox
+
+
+@pytest.fixture
+def native():
+    """纯 Python 任务允许跳过，强制 Rust 任务缺失扩展时必须失败。"""
+    extension = get_native()
+    return extension
+
+
+def test_native_registration_contract(native):
+    """约束重构前的平面扩展接口、签名和类型身份，防止拆分模块时漏注册或改名。"""
+    functions = {
+        "ofd_glyph_geometries": "(direction, rotation, origins, boxes, clip)",
+        "ofd_glyph_geometry_stats": "()",
+        "ofd_table_components": "(lines, count, limit)",
+        "ofd_table_logical_cells": "(xs, ys, lines, count, limit)",
+        "ofd_table_stats": "()",
+        "rtf_group_spans": "(data, direct_only, max_tokens, max_depth)",
+        "rtf_group_stats": "()",
+        "spreadsheet_select_regions": "(starts, content_points, content_rectangles, semantic_positions, spans, max_row, max_col, diagnostics=False)",
+        "spreadsheet_discover_regions": "(starts, content_points, content_rectangles, max_row, max_col, gap_tolerance)",
+        "spreadsheet_keep_maximal_semantic_sets": "(semantic_sets)",
+        "spreadsheet_region_stats": "()",
+        "image_components": "(data, width, height)",
+        "image_contours": "(data, width, height, external)",
+        "image_resize": "(data, width, height, channels, depth, target_w, target_h, mode, xindices, xweights, yindices, yweights)",
+        "image_warp": "(data, width, height, channels, depth, target_w, target_h, mode, replicate, value, inverse, affine)",
+        "image_minimum_rectangle": "(data)",
+        "image_morphology": "(data, width, height, kw, kh, dilate)",
+        "image_morphology_indices": "(data, width, height, kw, kh, dilate, nan_rank)",
+        "image_lines": "(data, width, height, channels, lines, value, thickness)",
+        "image_polygons": "(width, height, polygons, value)",
+        "image_solve": "(matrix, rhs)",
+        "prepare_fill_bands": "(boxes)",
+        "graphic_numeric_lines": "(lines, mode, line_type, matcher)",
+        "year_header_groups": "(lines, rules, em)",
+        "typography_owned": "(line, size, line_type, bbox_type, glyph_flags, family_name)",
+        "math_words_owned": "(line, line_type, finder)",
+        "marker_sources_owned": "(lines, line_type, bbox_type)",
+        "marker_glyphs_owned": "(line, page, angle, line_type, bbox_type, normalizer, compact)",
+        "blank_top_bitmap": "(data, width, height, stride, mode)",
+        "table_pending_glyphs_owned": "(chars, table, angle, bbox_type, normalizer, record_type, allocator)",
+        "fraction_members_owned": "(chars, tight, page, angle, rules, rule_type=None)",
+        "overlap_member_groups": "(members, regions, threshold)",
+        "exact_float_mean": "(values)",
+        "code_rule_windows": "(horizontal, vertical, lines, excluded, em, page_height)",
+        "glyph_bold_indices_owned": "(lines, bold, metadata, line_type)",
+        "lane_profile_context_owned": "(lanes, lane_type, line_type)",
+        "fragment_rows_owned": "(fragments, height, fragment_type, row_type, mean, total)",
+        "project_content_chars_owned": "(content, normalizer, record_type, allocator)",
+        "owned_font_run_metadata": "(chars, positions, angle, run_ids, run_keys, font_metadata, script_group, run_key, anchor_text, layout)",
+        "supported_lane_intervals_owned": "(rows, width, median, line_type)",
+        "lane_assignments_owned": "(rows, lanes, tolerance, nested, line_type, lane_type)",
+        "plain_source_records_owned": "(chars, tight, loose, origins, anchors_only, anchor, box_type)",
+        "short_tail_lane_events": "(lanes, median, lane_type, line_type)",
+        "fragment_row_groups": "(items, tolerance, mean)",
+        "prose_rule_conflicts": "(drafts, grids, rules, lines)",
+        "prose_rule_eligible": "(drafts, grids)",
+        "compound_baselines": "(groups, em)",
+        "form_state_events": "(data)",
+        "form_state_program": "(data)",
+        "numeric_noise_candidates": "(lines, visual)",
+        "raster_axis_groups": "(lines)",
+        "grow_formula_component": "(lines, seed_count, tables)",
+        "detached_formula_component": "(boxes, operators, em, available)",
+        "short_tail_destinations": "(lines, lanes, median)",
+        "isolated_path_groups": "(boxes, em)",
+        "overpainted_addresses": "(texts, covers)",
+        "short_tail_destinations_owned": "(pending, lanes, median)",
+        "glyph_masks": "(data, width, height, boxes)",
+        "blank_top_rgb": "(data, width, height)",
+        "blank_top_gray": "(data, width, height)",
+        "inline_style_stats": "()",
+        "crop_bitmap_bgr": "(data, width, height, stride, mode, bbox, angle)",
+        "build_geometry_style": "(samples, by_line, keys, sample_type, run_type, line_type, page_sizes=None, bbox_type=None)",
+        "build_geometry_runs": "(samples, by_line, keys, sample_type, run_type)",
+        "text_snapshot_stats": "()",
+        "visual_evidence_stage_stats": "()",
+        "geometry_evidence_stats": "()",
+        "classification_snapshot_stats": "()",
+        "image_text_snapshot_stats": "()",
+        "read_pdfium_image_text": "(addresses, handle, count, frame, rotation, images, visibility, overlap)",
+        "read_pdfium_classification": "(addresses, handle, count, cjk_ranges, allowed_controls, private_range, normalize_font)",
+        "script_snapshot_stats": "()",
+        "anchor_pairs": "(records, positive_source)",
+        "assign_cells": "(glyphs, specs, index)",
+        "component_specs": "(parents, rows, cols)",
+        "confirmed_offsets": "(records, pairs, exact)",
+        "coverage_batch": "(rules, queries)",
+        "dedup_components": "(count, pairs)",
+        "grid_parents": "(count, pairs)",
+        "hidden_candidates": "(records)",
+        "inline_script_matches": "(records)",
+        "lane_gap": "(boxes, heights, restored, skip)",
+        "line_neighbors": "(records)",
+        "local_boxes": "(values, size, angle, fallback)",
+        "mapping_runs": "(records)",
+        "mapping_glyph_rows": "(chars, bbox_type)",
+        "materialize_geometry": "(rows, frame, rounded, angle)",
+        "merge_rules": "(rules, coordinates, tolerance, join)",
+        "normalize_boxes": "(values, strict, fallback)",
+        "ordered_clusters": "(values, tolerance, relative, last_only)",
+        "paint_pairs": "(records)",
+        "read_pdfium_char_batches": "(addresses, handle, count, extended, unicode_fallback=None)",
+        "group_text_lines": "(chars, height_threshold, distance)",
+        "prepare_visual_lines": "(chars, size, page_rotation, supported_angles)",
+        "read_pdfium_subpaths": "(addresses, handle)",
+        "read_pdfium_text_snapshot": "(addresses, color_addresses, handle, count, extended, frame, rotation, visibility, unicode_fallback=None)",
+        "read_pdfium_chars": "(addresses, handle, count, extended)",
+        "restore_surrogate_chars": "(chars, codes, raw_count)",
+        "read_pdfium_char_form_owners": "(function, handle, count, owners)",
+        "read_pdfium_marked_content": "(addresses, objects)",
+        "read_pdfium_objects": "(addresses, handle, kind, max_depth, root=None)",
+        "read_pdfium_text_visibility": "(addresses, handle, frame, rotation, max_depth)",
+        "read_pdfium_text_visibility_with_roots": "(addresses, handle, frame, rotation, max_depth)",
+        "read_pdfium_drawing_lines": "(addresses, handle, bbox, rotation)",
+        "pdfium_drawing_line_stage_stats": "()",
+        "read_pdfium_path_evidence": "(addresses, handle, frame, rotation, max_depth, want_lines, want_infos)",
+        "read_pdfium_visual_batches": "(addresses, handle, count, extended, frame, angle, unicode_fallback=None)",
+        "script_roles": "(records)",
+        "numeric_script_indices": "(records, roles)",
+        "script_roles_raw": "(loose, tight, origins, flags, fonts, fallback)",
+        "script_roles_raw_batch": "(loose, tight, origins, flags, fonts, offsets, fallback)",
+        "script_roles_plain_batch": "(loose, tight, origins, flags, fonts, offsets, fallback)",
+        "source_rows": "(raw, side, tight, origins, rotations, size, angle, fallback)",
+        "source_rows_plain": "(records, size, angle)",
+        "table_boxes": "(values, table, angle, fallback)",
+        "table_row_occupancy": "(rows, tracks)",
+        "table_cluster_positions": "(values, tolerance)",
+        "cell_visual_groups_owned": "(glyphs, height, glyph_type)",
+        "tight_space_candidates": "(chars_by_source, glyphs, glyph_type, ordinary)",
+        "unmapped_formula_ink": "(chars, glyph_flags)",
+        "table_visual_rows": "(boxes, ids, median_height)",
+        "title_gaps": "(records)",
+        "typography_metrics": "(boxes, fonts, weights, families, fallback_height)",
+        "visual_runs": "(raw, overrides, flags, size, angle, fallback)",
+    }
+    classes = {
+        "NativeFillBands": ("builtins", "(boxes)"),
+        "NativeColumnCache": ("builtins", "(compensated)"),
+        "OwnedRuleCore": ("docvortex._native", None),
+        "NativeTableGrid": ("docvortex._native", "(grids, rows, size, angle, height)"),
+        "NativeTableMerger": ("docvortex._native", "()"),
+        "NativeStyleDocument": ("docvortex._native", "(with_samples=False)"),
+        "NativeGeometryRisk": ("docvortex._native", "()"),
+        "NativeGeometryRuns": ("docvortex._native", "()"),
+        "NativeTextSnapshot": ("docvortex._native", None),
+        "NativeGeometryEvidence": ("docvortex._native", None),
+        "NativeClassificationSnapshot": ("docvortex._native", None),
+        "NativeImageTextSnapshot": ("docvortex._native", None),
+        "NativeScriptEvidence": ("docvortex._native", None),
+        "NativeFontProvider": (
+            "docvortex._native",
+            "(addresses, data, tables, cache_name, aliases, suffixes, classify_legacy)",
+        ),
+        "AnnotationGeometry": ("builtins", "(fragments)"),
+        "BaselineCandidates": ("builtins", "(bounds, groups)"),
+        "BaselineGeometryCandidates": ("builtins", "(bounds, groups, boxes, heights, sources)"),
+        "PdfiumCharacterBatches": ("docvortex._native", None),
+        "PdfiumVisualCharacterBatches": ("docvortex._native", None),
+        "PdfiumObjectBatches": ("docvortex._native", None),
+        "PdfiumDrawingLineBatches": ("docvortex._native", None),
+        "PdfiumPathLineBatches": ("docvortex._native", None),
+        "PdfiumPathInfoBatches": ("docvortex._native", None),
+        "PreparedRuleCandidates": ("builtins", "(centers, rows)"),
+        "PdfiumReadError": ("_native", None),
+        "StableColumnClusters": ("builtins", "(compensated)"),
+        "TableNoteMetrics": ("builtins", "(items)"),
+        "TableRowGeometry": ("builtins", "(boxes)"),
+    }
+    constants = {"PROTOCOL_VERSION": 45, "PDFIUM_RECORD_BATCH_SIZE": 1024}
+    assert {name for name in dir(native) if not name.startswith("__")} == functions.keys() | classes.keys() | constants.keys()
+    for name, signature in functions.items():
+        function = getattr(native, name)
+        assert callable(function)
+        assert function.__name__ == name
+        assert function.__module__ == "docvortex._native"
+        assert function.__text_signature__ == signature
+    for name, (module, signature) in classes.items():
+        cls = getattr(native, name)
+        assert isinstance(cls, type)
+        assert cls.__name__ == name
+        assert cls.__module__ == module
+        assert cls.__text_signature__ == signature
+    for name, value in constants.items():
+        assert getattr(native, name) == value
+    assert issubclass(native.PdfiumReadError, Exception)
+    rows = native.TableNoteMetrics([(0, 0.0, 1.0)]).prepare_rows([[]])
+    assert type(rows).__name__ == "TableNoteCore"
+    assert type(rows).__module__ == "builtins"
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_script_geometry_random_parity(native, seed, native_golden):
+    """随机改变字体、尺寸、基线和字符类别，覆盖组件分组及角色精炼。"""
+    rng = random.Random(seed)
+    alphabet = "Ab09０９中文 αβ²₃,-—/⁄()\n\t\ufffd"
+    for _ in range(12):
+        chars, tight, origins = [], {}, {}
+        for i in range(rng.randrange(1, 100)):
+            x = i * rng.choice([3.0, 5.0, 12.0])
+            y = rng.choice([10.0, 10.35, 9.5, 12.0, 14.0])
+            h = rng.choice([4.0, 6.0, 10.0])
+            chars.append(
+                {
+                    "char": rng.choice(alphabet),
+                    "char_idx": i,
+                    "bbox": Bbox([x, y - h, x + 4, y + 1]),
+                    "font": {"name": rng.choice(["A", "B", ""]), "flags": 0, "weight": 400},
+                }
+            )
+            if rng.random() > 0.04:
+                tight[i] = (x, y - h + 1, x + 3, y)
+                origins[i] = (x, y)
+        protected = {i for i in range(len(chars)) if rng.random() < 0.04}
+        before = pickle.dumps((chars, tight, origins))
+        native_golden(
+            scripts.classify_char_script_roles(chars, tight_bboxes=tight, origins=origins, protected_body_indices=protected)
+        )
+        assert pickle.dumps((chars, tight, origins)) == before
+
+
+@pytest.mark.parametrize("name", ["caibao1", "demo1", "demo2"])
+def test_real_page_script_parity(native, name, native_golden):
+    """逐页比较真实字符和 side-map，源文件和输入对象保持不变。"""
+    path = Path(__file__).parents[1] / "demo/pdfs" / f"{name}.pdf"
+    with PDFDocument(str(path)) as document:
+        for index in range(len(document)):
+            page = document[index]
+            geometry = page.get_chars_with_geometry()
+            native_golden(
+                scripts.classify_char_script_roles(geometry.chars, tight_bboxes=geometry.tight_bboxes, origins=geometry.origins)
+            )
+
+
+def test_native_script_path_is_exercised(native, monkeypatch):
+    """确认普通输入真实执行扩展，不能用参考实现冒充原生通过。"""
+    chars = [{"char": "a", "char_idx": 0, "bbox": Bbox([0, 0, 5, 10])}]
+
+    calls = []
+    original = native.script_roles_raw
+
+    def observed(*args, **kwargs):
+        """记录真实原生分类调用。"""
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(native, "script_roles_raw", observed)
+    assert scripts.classify_char_script_roles(chars, tight_bboxes={0: (0, 0, 5, 9)}, origins={0: (0, 9)}) == ["body"]
+    assert calls == [True]
+
+
+@pytest.mark.parametrize("angle", [0, 90, 180, 270])
+def test_visual_runs_and_typography_parity(native, monkeypatch, angle, native_golden):
+    """随机字距、空白、反向框及字体权重下比较完整行对象和引用关系。"""
+    from docvortex.analyzers.native.pdf import native_text
+    from docvortex.analyzers.native.pdf.models import _LineItem
+
+    rng = random.Random(angle + 7)
+    for _ in range(60):
+        chars = []
+        x = 0
+        for i in range(rng.randrange(1, 90)):
+            x += rng.choice([2, 5, 8, 20])
+            char = {
+                "char": rng.choice("中文aA12 ,\t\n"),
+                "char_idx": i,
+                "bbox": Bbox([x, 20, x + 4, 30]),
+                "font": {"name": rng.choice(["Abc", "Def", ""]), "flags": 0, "weight": rng.choice([0, 400, 700])},
+            }
+            chars.append(char)
+        line = _LineItem("".join(c["char"] for c in chars), (0, 20, x + 5, 30), angle, 0, chars=chars)
+        before = pickle.dumps(line)
+        actual = native_text._split_native_visual_runs(line, (1000, 1000))
+        native_golden(actual)
+        assert all(any(c is source for source in chars) for item in actual for c in item.chars)
+        assert pickle.dumps(line) == before
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_dedup_layers_and_hidden_parity(native, monkeypatch, seed, native_golden):
+    """对混合重复绘制、平移阴影和隐藏副本逐值比较，并检查来源引用不被改写。"""
+    from docvortex.document.pdf.text import dedup
+    from test_pdf_text_dedup import _char, _indexed
+
+    rng = random.Random(seed)
+    chars = []
+    text = "ABCD 中文123 ab"
+    for layer in range(rng.randrange(1, 5)):
+        dx, dy = rng.choice([(0, 0), (0.08, 0.08), (1.0, 1.0), (8, 0)])
+        for i, c in enumerate(text):
+            chars.append(_char(c, i * 10 + dx, 20 + dy, obj=layer, mode=3 if layer == 2 else 0))
+    chars = _indexed(chars)
+    before = pickle.dumps(chars)
+    actual = dedup.deduplicate_chars(chars)
+    native_golden(actual)
+    assert pickle.dumps(chars) == before
+
+
+def test_table_coverage_batch_parity(native):
+    """区间乱序、反向端点、重复线和精确相接端点的覆盖率必须逐值一致。"""
+    from docvortex.analyzers.native.pdf._table_recovery.geometry import covered_interval_ratio
+
+    rng = random.Random(93)
+    rules = [(rng.randrange(2), float(rng.randrange(5)), rng.uniform(-5, 15), rng.uniform(-5, 15)) for _ in range(80)]
+    queries = [
+        (rng.randrange(2), (float(rng.randrange(5)),), float(rng.randrange(-2, 3)), float(rng.randrange(5, 12)), 0.5)
+        for _ in range(90)
+    ]
+    expected = [
+        covered_interval_ratio(
+            [(a, b) for o, c, a, b in rules if o == orientation and any(abs(c - v) <= tolerance for v in aliases)], start, end
+        )
+        for orientation, aliases, start, end, tolerance in queries
+    ]
+    assert native.coverage_batch(rules, queries) == expected
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_cell_assignment_batch_parity(native, indexed):
+    """覆盖边界平局、出界和跨格字符，保持现有索引路径的选择与歧义位。"""
+    from docvortex.analyzers.native.pdf._table_recovery import candidate as c
+    from docvortex.analyzers.native.pdf._table_recovery.contracts import NativeTableGlyph
+
+    specs = tuple(
+        c.GridCellSpec(r, col, 1, 1, (col * 10.0, r * 10.0, col * 10.0 + 10.0, r * 10.0 + 10.0))
+        for r in range(3)
+        for col in range(4)
+    )
+    index = c._build_grid_spec_index(3, 4, specs) if indexed else None
+    rng = random.Random(12)
+    glyphs = []
+    for i in range(300):
+        x, y = rng.uniform(-5, 45), rng.uniform(-5, 35)
+        glyphs.append(NativeTableGlyph(i, i, "a", (x, y, x + rng.choice([0.0, 5.0, 10.0, 20.0]), y + 5.0), 0))
+    expected = [
+        c._choose_cell_for_glyph_indexed(g, specs, index) if index is not None else c._choose_cell_for_glyph(g, specs)
+        for g in glyphs
+    ]
+    assert (
+        native.assign_cells(
+            [g.bbox for g in glyphs],
+            [s.bbox for s in specs],
+            (index.x_tracks, index.y_tracks, index.owners) if index is not None else None,
+        )
+        == expected
+    )
+
+
+def test_invalid_parent_cycle_is_rejected(native):
+    """损坏的私有数组不能让 Rust 陷入无限循环。"""
+    with pytest.raises(ValueError, match="cyclic"):
+        native.component_specs([1, 0], 1, 2)
+
+
+@pytest.mark.parametrize("angle", [0, 90, 180, 270])
+def test_canonical_coordinate_sharing(native, angle):
+    """长期存活的 canonical 样本复用未变坐标，旋转输出仍逐值匹配 Python。"""
+    from docvortex.analyzers.native.pdf import geometry
+
+    raw = tuple(float(str(v)) for v in (1.25, 2.5, 6.75, 8.5))
+    tight = tuple(float(str(v)) for v in (1.5, 3.0, 6.25, 8.0))
+    origin = (float("1.75"), float("7.25"))
+    before = pickle.dumps((raw, tight, origin))
+    source, ink, point, local_source, local_ink, local_point = native.source_rows(
+        [raw], [None], [tight], [origin], [0.0], (20.0, 30.0), angle, geometry._coerce_bbox
+    )[0]
+    assert (source, ink, tuple(point)) == (raw, tight, origin)
+    assert local_source == geometry._rotate_bbox_to_upright(raw, (20.0, 30.0), angle)
+    assert local_ink == geometry._rotate_bbox_to_upright(tight, (20.0, 30.0), angle)
+    assert tuple(local_point) == geometry._rotate_origin_to_upright(origin, (20.0, 30.0), angle)
+    assert all(a is b for a, b in zip(source, raw))
+    assert all(a is b for a, b in zip(ink, tight))
+    if angle == 0:
+        assert source is local_source and ink is local_ink and point is local_point
+    assert pickle.dumps((raw, tight, origin)) == before

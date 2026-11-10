@@ -4,10 +4,21 @@ from io import BytesIO
 from typing import Iterator
 from zipfile import BadZipFile, ZipFile, ZipInfo
 
+from .....foundation.ooxml_zip import OoxmlZipFile
+
 from loguru import logger
 from lxml import etree
 
-from ..opc import relationship_source_base_dir, write_zip_package
+from ..opc import (
+    CONTENT_TYPES_MEMBER,
+    STRICT_OOXML_COMMON_REPLACEMENTS,
+    STRICT_WORDPROCESSINGML_NS,
+    WORDPROCESSINGML_NS,
+    relationship_source_base_dir,
+    repair_content_type_overrides,
+    translate_strict_ooxml_uris,
+    write_zip_package,
+)
 
 
 PACKAGE_RELATIONSHIPS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
@@ -15,10 +26,31 @@ RELATIONSHIP_TAG = f"{{{PACKAGE_RELATIONSHIPS_NS}}}Relationship"
 ZIP_MEMBER_READ_ERRORS = (BadZipFile, RuntimeError, NotImplementedError, zlib.error)
 DOCX_EMBEDDED_OFFICE_PREFIX = "word/embeddings/"
 
+STRICT_DOCX_REPLACEMENTS = STRICT_OOXML_COMMON_REPLACEMENTS + (
+    (
+        STRICT_WORDPROCESSINGML_NS.encode("utf-8"),
+        WORDPROCESSINGML_NS.encode("utf-8"),
+    ),
+)
+
+# 关系类型尾段到 part 内容类型的映射，用于按关系图补全 [Content_Types].xml Override。
+DOCX_REL_CONTENT_TYPES = {
+    "officeDocument": "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+    "styles": "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml",
+    "numbering": "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml",
+    "footnotes": "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml",
+    "endnotes": "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml",
+    "comments": "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml",
+    "settings": "application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml",
+    "webSettings": "application/vnd.openxmlformats-officedocument.wordprocessingml.webSettings+xml",
+    "fontTable": "application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml",
+    "theme": "application/vnd.openxmlformats-officedocument.theme+xml",
+}
+
 
 def normalize_docx_package(file_bytes: bytes) -> bytes:
     """在进入 python-docx 前修复 DOCX 包级容错问题。"""
-    with ZipFile(BytesIO(file_bytes)) as source:
+    with OoxmlZipFile(BytesIO(file_bytes)) as source:
         package_members = {info.filename for info in source.infolist()}
         reachable_members, relationship_graph_complete = _collect_relationship_reachable_members(source, package_members)
         trusted_reachable_members = reachable_members if relationship_graph_complete else None
@@ -41,16 +73,32 @@ def normalize_docx_package(file_bytes: bytes) -> bytes:
         rewritten_members: list[tuple[ZipInfo, bytes]] = []
         for info, member_data in loaded_members:
             normalized_data = member_data
+            if info.filename.endswith(".xml") or info.filename.endswith(".rels"):
+                # ISO Strict 命名空间与关系类型统一改写为 Transitional，python-docx 才能识别。
+                normalized_data = translate_strict_ooxml_uris(normalized_data, STRICT_DOCX_REPLACEMENTS)
+                if normalized_data != member_data:
+                    changed = True
             if info.filename.endswith(".rels"):
                 normalized_data = _remove_missing_internal_relationships(
                     info.filename,
-                    member_data,
+                    normalized_data,
                     package_members,
                     skipped_members,
                 )
                 if normalized_data != member_data:
                     changed = True
             rewritten_members.append((info, normalized_data))
+
+        repaired_content_types = repair_content_type_overrides(
+            {info.filename: member_data for info, member_data in rewritten_members},
+            DOCX_REL_CONTENT_TYPES,
+        )
+        if repaired_content_types is not None:
+            rewritten_members = [
+                (info, repaired_content_types if info.filename == CONTENT_TYPES_MEMBER else member_data)
+                for info, member_data in rewritten_members
+            ]
+            changed = True
 
     if not changed:
         return file_bytes

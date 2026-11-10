@@ -7,7 +7,7 @@ import time
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from .assets import AssetStore
 from .document.source import HtmlSourceContext, prepare_source
@@ -39,20 +39,36 @@ def analyze(
     file_suffix: FileSuffix | None = None,
     page_range: str = "",
     source_context: HtmlSourceContext | None = None,
+    parse_mode: Literal["auto", "txt", "ocr"] = "auto",
+    pdf_structure: Literal["auto", "off"] = "auto",
 ) -> AnalysisResult:
-    """执行原生分析，显式调用者选择不会被隐式分类或 OCR 改写。"""
+    """分析原生文档；PDF 自动分类或显式模式需要 OCR 时提示改用 MinerU。"""
     from .analyzers.native import models
+    from .errors import DocumentError, InvalidRequestError
+
+    if parse_mode not in {"auto", "txt", "ocr"}:
+        raise InvalidRequestError("parse_mode_invalid", "parse_mode must be auto, txt, or ocr", "parse_mode")
+    if pdf_structure not in {"auto", "off"}:
+        raise InvalidRequestError("pdf_structure_invalid", "pdf_structure must be auto or off", "pdf_structure")
 
     started = time.perf_counter()
     native_diagnostics: tuple[Diagnostic, ...] = ()
     extensions = {}
-    prepared = prepare_source(source, file_suffix=file_suffix, page_range=page_range, source_context=source_context)
+    prepared = prepare_source(
+        source,
+        file_suffix=file_suffix,
+        page_range=page_range,
+        source_context=source_context,
+        preserve_pdf_structure=pdf_structure == "auto" and parse_mode != "ocr",
+    )
     try:
+        if prepared.file_suffix != "pdf" and pdf_structure != "auto":
+            raise InvalidRequestError("pdf_structure_invalid", "pdf_structure is supported only for PDF", "pdf_structure")
+        if prepared.file_suffix != "pdf" and parse_mode != "auto":
+            raise InvalidRequestError("parse_mode_invalid", "Explicit parse modes are supported only for PDF", "parse_mode")
         properties = prepared.source_properties
         metadata_diagnostics = tuple(Diagnostic("read_metadata_failed", message) for message in prepared.metadata_warnings)
-        if prepared.file_suffix != "pdf":
-            from .errors import DocumentError
-
+        if prepared.file_suffix not in {"pdf", "mhtml"}:
             try:
                 extracted = extract_metadata(
                     prepared.data, file_suffix=prepared.file_suffix, source_context=prepared.source_context
@@ -60,6 +76,8 @@ def analyze(
                 properties = extracted.metadata.document
                 metadata_diagnostics = extracted.diagnostics
             except DocumentError as exc:
+                if exc.code == "resource_limit":
+                    raise
                 # 正文读取器仍负责输入有效性；可选属性提取失败不能阻断正文解析。
                 metadata_diagnostics = (Diagnostic(exc.code, str(exc)),)
         if prepared.file_suffix == "pdf":
@@ -67,10 +85,31 @@ def analyze(
             from .document.pdf.visuals import attach_visual_block_images_from_pdf
 
             assert prepared.document is not None
+            pdf_model = models.PdfModel()
+            tagged = (
+                pdf_model._prepare_structure(prepared.document) if pdf_structure == "auto" and parse_mode != "ocr" else None
+            )
+            resolved_mode = (
+                ("txt" if tagged is not None and tagged.complete else prepared.document.classify())
+                if parse_mode == "auto"
+                else parse_mode
+            )
+            if resolved_mode == "ocr":
+                raise DocumentError(
+                    "pdf_ocr_unsupported",
+                    "PDF OCR is not supported by DocVortex. Please download and install MinerU to process this document: "
+                    "https://github.com/opendatalab/MinerU",
+                )
             geometry, geometry_diagnostics = extract_layout_geometry(prepared.document, prepared.page_index_map)
             extensions[LAYOUT_EXTENSION] = geometry
             native_diagnostics += geometry_diagnostics
-            pages = models.PdfModel().predict(prepared.document)
+            pages = (
+                pdf_model.predict(prepared.document)
+                if pdf_structure == "auto"
+                else pdf_model.predict(prepared.document, pdf_structure=pdf_structure)
+            )
+            native_diagnostics += pdf_model.diagnostics
+            extensions.update(pdf_model.extensions)
             attach_visual_block_images_from_pdf(prepared.document, pages)
             attach_layout_image_rotations(geometry, pages, prepared.page_index_map)
         elif prepared.file_suffix == "ofd":
@@ -81,6 +120,14 @@ def analyze(
             )
         elif prepared.file_suffix == "html":
             pages = models.HtmlModel().predict(BytesIO(prepared.data), source_context=prepared.source_context)
+        elif prepared.file_suffix == "mhtml":
+            from .analyzers.native.mhtml.converter import MhtmlConverter
+
+            converter = MhtmlConverter()
+            converter.convert(BytesIO(prepared.data), source_context=prepared.source_context)
+            pages = converter.pages
+            properties = converter.properties
+            native_diagnostics = converter.diagnostics
         else:
             model_types: dict[FileSuffix, type[NativeBinaryAnalyzer]] = {
                 "csv": models.CsvModel,
@@ -116,15 +163,14 @@ def analyze(
         )
         return AnalysisResult(model, diagnostics=diagnostics, elapsed_seconds=time.perf_counter() - started)
     finally:
-        if prepared.owns_document and prepared.document is not None:
-            prepared.document.close()
+        prepared.close()
 
 
 def postprocess(
     analysis: AnalysisResult | ModelJson, *, assets: AssetStore | None = None, keep_model_json: bool = False
 ) -> DocumentResult:
     """执行确定性后处理并物化结果素材，智能增强由上层显式调用。"""
-    from .export.files import materialize_middle
+    from .export._images import _materialize_owned_images
     from .postprocess.document import model_json_to_middle_json
 
     if isinstance(analysis, AnalysisResult):
@@ -140,7 +186,8 @@ def postprocess(
             if diagnostic.code == "broken_page" and diagnostic.page_index is not None:
                 pages.setdefault(diagnostic.page_index, PageInfo(page_idx=diagnostic.page_index))
         middle.pages = [pages[index] for index in sorted(pages)]
-    middle, result_assets = materialize_middle(middle, assets)
+    # 转换层已深复制页面、metadata 和 extensions；此新文档尚未交给外部调用方。
+    middle, result_assets = _materialize_owned_images(middle, assets)
     return DocumentResult(middle, result_assets, model if keep_model_json else None, diagnostics)
 
 
@@ -151,10 +198,19 @@ def parse(
     page_range: str = "",
     source_context: HtmlSourceContext | None = None,
     keep_model_json: bool = False,
+    parse_mode: Literal["auto", "txt", "ocr"] = "auto",
+    pdf_structure: Literal["auto", "off"] = "auto",
 ) -> DocumentResult:
     """完成输入、分析及后处理，返回可脱离原文件使用的结果。"""
     return postprocess(
-        analyze(source, file_suffix=file_suffix, page_range=page_range, source_context=source_context),
+        analyze(
+            source,
+            file_suffix=file_suffix,
+            page_range=page_range,
+            source_context=source_context,
+            parse_mode=parse_mode,
+            pdf_structure=pdf_structure,
+        ),
         keep_model_json=keep_model_json,
     )
 
@@ -227,9 +283,18 @@ def convert(
     source_context: HtmlSourceContext | None = None,
     options: RenderOptions | None = None,
     overwrite: bool = False,
+    parse_mode: Literal["auto", "txt", "ocr"] = "auto",
+    pdf_structure: Literal["auto", "off"] = "auto",
 ) -> ExportResult:
-    """使用完整原生流程进行一次转换，并返回实际写出的文件路径。"""
-    result = parse(source, file_suffix=file_suffix, page_range=page_range, source_context=source_context)
+    """按指定解析模式完成转换，并返回实际写出的文件路径。"""
+    result = parse(
+        source,
+        file_suffix=file_suffix,
+        page_range=page_range,
+        source_context=source_context,
+        parse_mode=parse_mode,
+        pdf_structure=pdf_structure,
+    )
     return result.export(output_path, output_format=output_format, options=options, overwrite=overwrite)
 
 

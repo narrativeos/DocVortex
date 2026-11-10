@@ -26,7 +26,7 @@ from _span_test_utils import inline_text
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_OFFICE_SAMPLE_DIR = _PROJECT_ROOT / "demo" / "office_docs"
+_OFFICE_SAMPLE_DIR = _PROJECT_ROOT / "demo" / "ms_office_docs"
 
 
 def _predict_sample(model: Any, suffix: str) -> list[list[dict[str, Any]]]:
@@ -61,7 +61,10 @@ def _set_subtitle(slide: Any, text: str) -> None:
 
 
 def test_office_models_store_standalone_images_in_image_base64() -> None:
-    """验证三类 Office model 的独立图片统一通过 image_base64 输出。"""
+    """验证三类 Office model 的独立图片载荷统一通过 image_base64 输出。
+
+    content 只允许承载 descr 替代文本（纯文本），不得携带图片载荷。
+    """
     for suffix, model in (
         ("docx", DocxModel()),
         ("pptx", PptxModel()),
@@ -73,10 +76,11 @@ def test_office_models_store_standalone_images_in_image_base64() -> None:
 
         assert image_blocks, suffix
         for block in image_blocks:
-            assert "content" not in block
             assert isinstance(block.get("image_base64"), str)
             assert block["image_base64"].startswith("data:image/")
             assert ";base64," in block["image_base64"]
+            if "content" in block:
+                assert not block["content"].startswith("data:image/")
 
 
 def test_pptx_svg_picture_rasterizes_to_png(monkeypatch: Any) -> None:

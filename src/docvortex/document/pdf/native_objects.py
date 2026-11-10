@@ -6,7 +6,7 @@ import ctypes
 import hashlib
 import logging
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Iterator
 
 import pypdfium2 as pdfium
@@ -19,8 +19,6 @@ from .native_contracts import (
     DRAWING_LINE_AXIS_RATIO_TOLERANCE,
     DRAWING_LINE_MERGE_TOLERANCE,
     DRAWING_LINE_MIN_LENGTH,
-    DRAWING_THIN_RECT_MAX_THICKNESS,
-    DRAWING_THIN_RECT_MIN_ASPECT_RATIO,
     PDF_IMAGE_FINGERPRINT_MAX_RAW_BYTES,
     PDFDrawingLine,
     PDFImageInfo,
@@ -36,6 +34,9 @@ from .native_coordinates import (
 )
 
 logger = logging.getLogger("docvortex.document.pdf._document")
+
+# 仅供同一次页面提取共享；键中的地址不持有对象，页面关闭前必须清空。
+_FormExtentCache = dict[tuple[int, BBox, int], BBox | None]
 
 
 @dataclass(frozen=True)
@@ -96,32 +97,14 @@ def _walk_clipped_objects(
     parent_matrix: tuple = (1, 0, 0, 1, 0, 0),
     depth: int = 0,
     inherited_clip: BBox | None = None,
+    max_depth: int = DRAWING_FORM_MAX_DEPTH,
 ) -> Iterator[_ClippedObject]:
-    """遍历可见叶子并传播 Form 裁剪；对象矩阵只变换内容，clip 使用父矩阵。"""
-    if depth >= DRAWING_FORM_MAX_DEPTH:
-        return
-    count = pdfium_c.FPDFFormObj_CountObjects if is_form else pdfium_c.FPDFPage_CountObjects
-    get = pdfium_c.FPDFFormObj_GetObject if is_form else pdfium_c.FPDFPage_GetObject
-    try:
-        size = int(count(container))
-    except Exception:
-        return
-    for index in range(max(0, size)):
-        try:
-            raw = get(container, index)
-            matrix = _get_raw_object_matrix(raw) if raw else None
-            if matrix is None:
-                continue
-            combined = _multiply_pdf_matrices(matrix, parent_matrix)
-            clip = _object_clip_bbox(raw, parent_matrix, inherited_clip)
-            if int(pdfium_c.FPDFPageObj_GetType(raw)) == pdfium_c.FPDF_PAGEOBJ_FORM:
-                yield from _walk_clipped_objects(
-                    raw, is_form=True, parent_matrix=combined, depth=depth + 1, inherited_clip=clip
-                )
-            else:
-                yield _ClippedObject(raw, combined, parent_matrix, depth, clip)
-        except Exception:
-            continue
+    """由 Rust 遍历页面或 Form 子树，Python 仅包装借用叶子句柄。"""
+    from ._object_bridge import read_clipped_objects
+
+    root = (is_form, tuple(float(value) for value in parent_matrix), depth, inherited_clip)
+    for address, matrix, parent, level, clip in read_clipped_objects(container, -1, max_depth, root=root):
+        yield _ClippedObject(ctypes.cast(address, pdfium_c.FPDF_PAGEOBJECT), matrix, parent, level, clip)
 
 
 def _clip_object_visual_bbox(bbox: BBox, clip: BBox | None, page_bbox: BBox, rotation: int) -> BBox | None:
@@ -162,36 +145,49 @@ def _clipped_form_extent(raw: Any, page_bbox: BBox, rotation: int) -> BBox | Non
     return min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)
 
 
-def _clipped_objects_of_type(page: Any, object_type: int) -> Iterator[_ClippedObject]:
-    """过滤已累计裁剪的对象类型，路径 source_index 保持既有遍历顺序。"""
-    for member in _walk_clipped_objects(page):
-        if int(pdfium_c.FPDFPageObj_GetType(member.raw)) == object_type:
-            yield member
+def _shared_clipped_form_extent(raw: Any, page_bbox: BBox, rotation: int, cache: _FormExtentCache | None) -> BBox | None:
+    """在页面锁内按根对象和完整几何参数共享结果；无裁剪也缓存，异常不缓存。"""
+    if cache is None:
+        return _clipped_form_extent(raw, page_bbox, rotation)
+    address = ctypes.cast(raw, ctypes.c_void_p).value
+    if address is None:
+        return _clipped_form_extent(raw, page_bbox, rotation)
+    key = (address, page_bbox, rotation)
+    if key not in cache:
+        cache[key] = _clipped_form_extent(raw, page_bbox, rotation)
+    return cache[key]
 
 
-def _text_object_visibility(page: Any, page_bbox: BBox, rotation: int) -> dict[int, tuple[bool, BBox | None]]:
+def _clipped_objects_of_type(
+    page: Any,
+    object_type: int,
+    max_depth: int = DRAWING_FORM_MAX_DEPTH,
+) -> Iterator[_ClippedObject]:
+    """物化 Rust 遍历得到的对象，保留同库句柄与稳定来源顺序。"""
+    from ._object_bridge import read_clipped_objects
+
+    for address, matrix, parent, depth, clip in read_clipped_objects(page, object_type, max_depth):
+        yield _ClippedObject(ctypes.cast(address, pdfium_c.FPDF_PAGEOBJECT), matrix, parent, depth, clip)
+
+
+def _text_object_visibility(
+    page: Any, page_bbox: BBox, rotation: int, paint_page_reader=None
+) -> dict[int, tuple[bool, BBox | None]]:
     """一次遍历建立文字对象的绘制状态与有效裁剪；地址只在本次页面提取内使用。"""
-    output = {}
-    for member in _clipped_objects_of_type(page, pdfium_c.FPDF_PAGEOBJ_TEXT):
-        address = ctypes.cast(member.raw, ctypes.c_void_p).value
-        if not address:
-            continue
-        mode = int(pdfium_c.FPDFTextObj_GetTextRenderMode(member.raw))
-        visible = mode not in {3, 7}
-        if mode in {0, 1, 2, 4, 5, 6}:
-            visible = (
-                mode in {0, 2, 4, 6}
-                and _get_raw_object_alpha(member.raw, pdfium_c.FPDFPageObj_GetFillColor) > 0
-                or mode in {1, 2, 5, 6}
-                and _get_raw_object_alpha(member.raw, pdfium_c.FPDFPageObj_GetStrokeColor) > 0
-            )
-        clip = member.clip
-        if clip is not None:
-            if clip[2] <= clip[0] or clip[3] <= clip[1]:
-                visible = False
-            else:
-                clip = _transform_object_bbox(clip, lambda point: _transform_drawing_point(point, page_bbox, rotation))
-        output[address] = (visible, clip)
+    from ._object_bridge import read_text_visibility
+
+    records = read_text_visibility(page, page_bbox, rotation, DRAWING_FORM_MAX_DEPTH, with_roots=paint_page_reader is not None)
+    roots = None
+    if paint_page_reader is not None:
+        records, roots, paint = records
+    output = {address: (visible, clip) for address, visible, clip in records}
+    if paint_page_reader is not None:
+        from .text_occlusion import exclude_fully_overpainted_text
+
+        if len(output) != len(records):
+            # 非标准重复对象地址需要使用最终映射重新读框，保持原有合并可见性的语义。
+            roots, paint = None, None
+        output = exclude_fully_overpainted_text(page, page_bbox, rotation, output, paint_page_reader, roots=roots, paint=paint)
     return output
 
 
@@ -378,115 +374,14 @@ def _get_raw_object_alpha(raw_obj: Any, color_getter: Any) -> int:
     return rgba[3] if rgba is not None else 255
 
 
-def _get_path_visibility(raw_obj: Any) -> tuple[bool, bool]:
-    """分别判断 Path 的填充与描边是否实际可见。"""
-    fill_mode = ctypes.c_int()
-    stroke = ctypes.c_int()
-    try:
-        ok = pdfium_c.FPDFPath_GetDrawMode(raw_obj, ctypes.byref(fill_mode), ctypes.byref(stroke))
-    except Exception:
-        return False, False
-    if not ok:
-        return False, False
-
-    fill_visible = (
-        fill_mode.value != pdfium_c.FPDF_FILLMODE_NONE and _get_raw_object_alpha(raw_obj, pdfium_c.FPDFPageObj_GetFillColor) > 0
-    )
-    stroke_visible = bool(stroke.value) and _get_raw_object_alpha(raw_obj, pdfium_c.FPDFPageObj_GetStrokeColor) > 0
-    return fill_visible, stroke_visible
-
-
-def _get_raw_stroke_width(raw_obj: Any) -> float:
-    """读取 Path 在对象局部坐标中的描边宽度。"""
-    stroke_width = ctypes.c_float()
-    try:
-        ok = pdfium_c.FPDFPageObj_GetStrokeWidth(raw_obj, ctypes.byref(stroke_width))
-    except Exception:
-        return 0.0
-    if not ok:
-        return 0.0
-    width = abs(float(stroke_width.value))
-    return width if math.isfinite(width) else 0.0
-
-
-def _get_segment_stroke_width(
-    raw_width: float,
-    start: tuple[float, float],
-    end: tuple[float, float],
-    matrix: tuple[float, float, float, float, float, float],
-) -> float:
-    """按线段局部法向量换算非等比矩阵下的实际描边宽度。"""
-    delta_x = end[0] - start[0]
-    delta_y = end[1] - start[1]
-    segment_length = math.hypot(delta_x, delta_y)
-    a, b, c, d, _, _ = matrix
-    if segment_length <= 0:
-        scale = math.sqrt(abs(a * d - b * c))
-    else:
-        normal_x = -delta_y / segment_length
-        normal_y = delta_x / segment_length
-        transformed_x = a * normal_x + c * normal_y
-        transformed_y = b * normal_x + d * normal_y
-        scale = math.hypot(transformed_x, transformed_y)
-    width = raw_width * scale
-    return width if math.isfinite(width) else 0.0
-
-
 def _read_raw_path_subpaths(raw_obj: Any) -> list[_PathSubpath]:
-    """读取 Path 段并拆为子路径，只把 LINETO 与闭合边记录为直线段。"""
-    try:
-        segment_count = int(pdfium_c.FPDFPath_CountSegments(raw_obj))
-    except Exception:
-        return []
-    if segment_count <= 0:
-        return []
+    """由原生解码器读取 Path 子路径，仅在 Python 中包装结果。"""
+    from ._object_bridge import read_path_subpaths
 
-    subpaths: list[_PathSubpath] = []
-    current_subpath: _PathSubpath | None = None
-    current_point: tuple[float, float] | None = None
-    subpath_start: tuple[float, float] | None = None
-
-    for segment_index in range(segment_count):
-        try:
-            segment = pdfium_c.FPDFPath_GetPathSegment(raw_obj, segment_index)
-            if not segment:
-                continue
-            x = ctypes.c_float()
-            y = ctypes.c_float()
-            if not pdfium_c.FPDFPathSegment_GetPoint(segment, ctypes.byref(x), ctypes.byref(y)):
-                continue
-            point = (float(x.value), float(y.value))
-            segment_type = int(pdfium_c.FPDFPathSegment_GetType(segment))
-            segment_closes = bool(pdfium_c.FPDFPathSegment_GetClose(segment))
-        except Exception:
-            continue
-
-        if segment_type == pdfium_c.FPDF_SEGMENT_MOVETO:
-            if current_subpath is not None and current_subpath.points:
-                subpaths.append(current_subpath)
-            current_subpath = _PathSubpath(points=[point], straight_segments=[])
-            current_point = point
-            subpath_start = point
-        else:
-            if current_subpath is None:
-                current_subpath = _PathSubpath(points=[point], straight_segments=[])
-                current_point = point
-                subpath_start = point
-            else:
-                current_subpath.points.append(point)
-                if segment_type == pdfium_c.FPDF_SEGMENT_LINETO and current_point is not None:
-                    current_subpath.straight_segments.append((current_point, point))
-                current_point = point
-
-        if segment_closes and current_subpath is not None and current_point is not None and subpath_start is not None:
-            if current_point != subpath_start:
-                current_subpath.straight_segments.append((current_point, subpath_start))
-            current_subpath.closed = True
-            current_point = subpath_start
-
-    if current_subpath is not None and current_subpath.points:
-        subpaths.append(current_subpath)
-    return subpaths
+    return [
+        _PathSubpath(points, [(points[first], points[last]) for first, last in lines], closed)
+        for points, lines, closed in read_path_subpaths(raw_obj)
+    ]
 
 
 def _transform_path_subpath(
@@ -508,108 +403,36 @@ def _transform_path_subpath(
     )
 
 
-def _path_info_from_object(
-    raw_obj: Any,
-    matrix: tuple[float, float, float, float, float, float],
-    page_bbox: BBox,
-    page_rotation: int,
-    form_depth: int,
-    source_index: int,
-    *,
-    subpaths: list[_PathSubpath] | None = None,
-) -> PDFPathInfo | None:
-    """将一个原始 Path 转换为页面几何；贝塞尔控制点也纳入保守 bbox。"""
+_FILLED_RECTANGLE_ROUND = round
 
-    try:
-        segment_count = int(pdfium_c.FPDFPath_CountSegments(raw_obj))
-    except Exception:
-        return None
-    if segment_count <= 0:
-        return None
 
-    fill_visible, stroke_visible = _get_path_visibility(raw_obj)
-    points = [
-        point
-        for raw_subpath in (_read_raw_path_subpaths(raw_obj) if subpaths is None else subpaths)
-        for point in _transform_path_subpath(
-            raw_subpath,
-            matrix,
-            page_bbox,
-            page_rotation,
-        ).points
-    ]
-    if not points:
+def _filled_rectangle_bbox(subpath: _PathSubpath) -> BBox | None:
+    """仅把四角与直边均轴对齐的填充子路径记录为矩形，曲线和字形轮廓不能借外框冒充柱体。"""
+    points = subpath.points
+    if len(points) not in (4, 5) or len(subpath.straight_segments) not in (3, 4):
         return None
-    coordinates = [coordinate for point in points for coordinate in point]
-    if not all(math.isfinite(value) for value in coordinates):
+    if not all(math.isfinite(value) for point in points for value in point):
         return None
-
-    page_width, page_height = _drawing_page_size(page_bbox, page_rotation)
-    stroke_margin = 0.0
-    if stroke_visible:
-        a, b, c, d, _, _ = matrix
-        stroke_scale = max(math.hypot(a, b), math.hypot(c, d))
-        stroke_margin = 0.5 * _get_raw_stroke_width(raw_obj) * stroke_scale
-    bbox = (
-        max(0.0, min(point[0] for point in points) - stroke_margin),
-        max(0.0, min(point[1] for point in points) - stroke_margin),
-        min(page_width, max(point[0] for point in points) + stroke_margin),
-        min(page_height, max(point[1] for point in points) + stroke_margin),
+    x0, x1 = min(p[0] for p in points), max(p[0] for p in points)
+    y0, y1 = min(p[1] for p in points), max(p[1] for p in points)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    # 已含完整四角时，相同 round 映射后的集合必然相同；近似矩形仍完整执行原容差判定。
+    exact_corners = (
+        round is _FILLED_RECTANGLE_ROUND
+        and type(points) in (list, tuple)
+        and all(
+            type(point) is tuple and len(point) == 2 and type(point[0]) is float and type(point[1]) is float for point in points
+        )
+        and set(points) == {(x0, y0), (x0, y1), (x1, y0), (x1, y1)}
     )
-    if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
-        return None
-    return PDFPathInfo(
-        bbox=bbox,
-        segment_count=segment_count,
-        fill_visible=fill_visible,
-        stroke_visible=stroke_visible,
-        form_depth=form_depth,
-        source_index=source_index,
-        fill_rgba=(
-            _get_raw_object_rgba(
-                raw_obj,
-                pdfium_c.FPDFPageObj_GetFillColor,
-            )
-            if fill_visible
-            else None
-        ),
-    )
-
-
-def _get_thin_filled_subpath_line(
-    subpath: _PathSubpath,
-    page_size: tuple[float, float],
-) -> PDFDrawingLine | None:
-    """把闭合的细长填充子路径折叠为一条中心线，避免把矩形四边重复输出。"""
-    if len(subpath.points) < 4:
-        return None
-    x_values = [point[0] for point in subpath.points]
-    y_values = [point[1] for point in subpath.points]
-    x0, x1 = min(x_values), max(x_values)
-    y0, y1 = min(y_values), max(y_values)
-    width = x1 - x0
-    height = y1 - y0
-    if not subpath.closed:
-        # PDF 填充操作会隐式闭合子路径；仅接纳四个轴对齐顶点和三条直边，
-        # 不把开放折线、三角形或贝塞尔控制点的外框当作矩形横线。
-        if len(subpath.points) != 4 or len(subpath.straight_segments) != 3:
-            return None
-        corners = {(round(x, 3), round(y, 3)) for x, y in subpath.points}
+    if not exact_corners:
+        corners = {(round(x, 3), round(y, 3)) for x, y in points}
         if corners != {(round(x, 3), round(y, 3)) for x in (x0, x1) for y in (y0, y1)}:
             return None
-        if any(abs(a[0] - b[0]) > 0.001 and abs(a[1] - b[1]) > 0.001 for a, b in subpath.straight_segments):
-            return None
-    long_side = max(width, height)
-    short_side = min(width, height)
-    if (
-        long_side < DRAWING_LINE_MIN_LENGTH
-        or short_side > DRAWING_THIN_RECT_MAX_THICKNESS
-        or long_side < DRAWING_THIN_RECT_MIN_ASPECT_RATIO * max(short_side, 0.01)
-    ):
+    if any(abs(a[0] - b[0]) > 0.001 and abs(a[1] - b[1]) > 0.001 for a, b in subpath.straight_segments):
         return None
-    if width >= height:
-        return _make_axis_drawing_line((x0, (y0 + y1) / 2), (x1, (y0 + y1) / 2), short_side, page_size)
-    return _make_axis_drawing_line(((x0 + x1) / 2, y0), ((x0 + x1) / 2, y1), short_side, page_size)
+    return (x0, y0, x1, y1)
 
 
 def _make_axis_drawing_line(
@@ -683,43 +506,6 @@ def _make_axis_drawing_line(
     return None
 
 
-def _extract_path_drawing_lines(
-    raw_obj: Any,
-    matrix: tuple[float, float, float, float, float, float],
-    page_bbox: BBox,
-    page_rotation: int,
-    *,
-    subpaths: list[_PathSubpath] | None = None,
-) -> list[PDFDrawingLine]:
-    """从单个 Path 提取可见直线，坏 Path 返回空结果且不影响同页其他对象。"""
-    fill_visible, stroke_visible = _get_path_visibility(raw_obj)
-    if not fill_visible and not stroke_visible:
-        return []
-
-    page_size = _drawing_page_size(page_bbox, page_rotation)
-    raw_stroke_width = _get_raw_stroke_width(raw_obj) if stroke_visible else 0.0
-    drawing_lines: list[PDFDrawingLine] = []
-    for raw_subpath in _read_raw_path_subpaths(raw_obj) if subpaths is None else subpaths:
-        subpath = _transform_path_subpath(raw_subpath, matrix, page_bbox, page_rotation)
-        if fill_visible:
-            filled_line = _get_thin_filled_subpath_line(subpath, page_size)
-            if filled_line is not None:
-                drawing_lines.append(filled_line)
-                # 细长填充矩形已经折叠为中心线，不再输出其描边四条边。
-                continue
-        if not stroke_visible:
-            continue
-        for (raw_start, raw_end), (segment_start, segment_end) in zip(
-            raw_subpath.straight_segments,
-            subpath.straight_segments,
-        ):
-            stroke_width = _get_segment_stroke_width(raw_stroke_width, raw_start, raw_end, matrix)
-            drawing_line = _make_axis_drawing_line(segment_start, segment_end, stroke_width, page_size)
-            if drawing_line is not None:
-                drawing_lines.append(drawing_line)
-    return drawing_lines
-
-
 def _line_axis_coordinate(line: PDFDrawingLine) -> float:
     """返回绘图线在垂直于自身方向的轴坐标。"""
     return line.start[1] if line.orientation == "horizontal" else line.start[0]
@@ -760,13 +546,13 @@ def _merge_orientation_lines(
     if not lines:
         return []
     coordinate_clusters: list[list[PDFDrawingLine]] = []
+    # 输入按轴坐标升序排序，聚类最小值恒为其首元素，记住起点即可免整簇重扫。
+    cluster_start = 0.0
     for line in sorted(lines, key=lambda item: (_line_axis_coordinate(item), _line_main_interval(item)[0])):
-        if (
-            not coordinate_clusters
-            or _line_axis_coordinate(line) - min(_line_axis_coordinate(item) for item in coordinate_clusters[-1])
-            > DRAWING_LINE_MERGE_TOLERANCE
-        ):
+        coordinate = _line_axis_coordinate(line)
+        if not coordinate_clusters or coordinate - cluster_start > DRAWING_LINE_MERGE_TOLERANCE:
             coordinate_clusters.append([line])
+            cluster_start = coordinate
         else:
             coordinate_clusters[-1].append(line)
 
@@ -959,10 +745,14 @@ def _extract_page_image_infos(
             continue
         if image_bbox is None:
             continue
+        fingerprint = _get_raw_image_fingerprint(raw_obj, page)
+        smooth, blank_top = _image_visual_evidence(raw_obj, page, matrix, image_bbox, page_bbox, page_rotation)
         image_infos.append(
             PDFImageInfo(
                 bbox=image_bbox,
-                fingerprint=_get_raw_image_fingerprint(raw_obj, page),
+                fingerprint=fingerprint,
+                smooth_background=smooth,
+                blank_top_bbox=blank_top,
             )
         )
     return sorted(
@@ -971,10 +761,185 @@ def _extract_page_image_infos(
     )
 
 
+def _blank_image_top_fraction(image) -> float:
+    """按原生阈值识别全宽近白顶边，Pillow 只负责透明像素白底合成。"""
+    from PIL import Image
+    from ..._compute_backend import get_native
+
+    if image.width * image.height > 4_000_000:
+        return 0.0
+    native = get_native()
+    if "transparency" not in image.info:
+        if image.mode == "RGB":
+            return native.blank_top_rgb(image.tobytes(), image.width, image.height)
+        if image.mode == "L":
+            return native.blank_top_gray(image.tobytes(), image.width, image.height)
+    with (
+        image.convert("RGBA") as rgba,
+        Image.new("RGBA", rgba.size, "white") as background,
+        Image.alpha_composite(background, rgba) as flat,
+        flat.convert("RGB") as rgb,
+    ):
+        return native.blank_top_rgb(rgb.tobytes(), rgb.width, rgb.height)
+
+
+_BITMAP_BLANK_REFERENCES = (_blank_image_top_fraction, pdfium.PdfBitmap.to_pil, pdfium.PdfBitmap.__getattribute__)
+
+
+def _bitmap_blank_top_fraction(bitmap):
+    """锁内复制普通无透明位图的独立缓冲，保留 Pillow 通道与白边阈值，透明格式完整回退。"""
+    from ..._compute_backend import get_native
+
+    native = get_native()
+    if (
+        type(bitmap) is pdfium.PdfBitmap
+        and (_blank_image_top_fraction, pdfium.PdfBitmap.to_pil, pdfium.PdfBitmap.__getattribute__) == _BITMAP_BLANK_REFERENCES
+        and bitmap.mode in ("RGB", "BGR", "RGBX", "BGRX", "L")
+    ):
+        value = native.blank_top_bitmap(bytes(bitmap.buffer), bitmap.width, bitmap.height, bitmap.stride, bitmap.mode)
+        if value is not None:
+            return value
+    with bitmap.to_pil() as original:
+        return _blank_image_top_fraction(original)
+
+
+def _native_image_blank_top_bbox(raw_obj, page, matrix, image_bbox, page_bbox, page_rotation):
+    """正向轴对齐且未裁切顶部的原图才能提供白边证据，损坏或旋转对象均保守保留。"""
+    if page_rotation != 0 or matrix[0] <= 0 or matrix[3] <= 0 or abs(matrix[1]) + abs(matrix[2]) > 1e-6:
+        return None
+    full = _image_bbox_from_matrix(matrix, page_bbox, page_rotation)
+    if full is None or abs(full[1] - image_bbox[1]) > 0.5:
+        return None
+    bitmap = None
+    try:
+        metadata = pdfium_c.FPDF_IMAGEOBJ_METADATA()
+        if (
+            not pdfium_c.FPDFImageObj_GetImageMetadata(raw_obj, page, ctypes.byref(metadata))
+            or not 0 < metadata.width * metadata.height <= 4_000_000
+        ):
+            return None
+        raw_bitmap = pdfium_c.FPDFImageObj_GetBitmap(raw_obj)
+        if not raw_bitmap:
+            return None
+        bitmap = pdfium.PdfBitmap.from_raw(raw_bitmap)
+        fraction = _bitmap_blank_top_fraction(bitmap)
+        top = full[1] + fraction * (full[3] - full[1])
+        return (image_bbox[0], top, image_bbox[2], image_bbox[3]) if fraction and top < image_bbox[3] else None
+    except Exception:
+        return None
+    finally:
+        if bitmap is not None:
+            bitmap.close()
+
+
+def _is_smooth_page_background(raw_obj: Any, page: pdfium.PdfPage, image_bbox: BBox, page_bbox: BBox) -> bool:
+    """仅为近整页图提取低分辨率色差证据，区分渐变背景与包含文字或图形的内容图。"""
+    page_area = max(0.0, page_bbox[2] - page_bbox[0]) * max(0.0, page_bbox[3] - page_bbox[1])
+    if page_area <= 0 or (image_bbox[2] - image_bbox[0]) * (image_bbox[3] - image_bbox[1]) < 0.95 * page_area:
+        return False
+    bitmap = None
+    try:
+        metadata = pdfium_c.FPDF_IMAGEOBJ_METADATA()
+        if (
+            not pdfium_c.FPDFImageObj_GetImageMetadata(raw_obj, page, ctypes.byref(metadata))
+            or metadata.width * metadata.height > 16_000_000
+        ):
+            return False
+        raw_bitmap = pdfium_c.FPDFImageObj_GetBitmap(raw_obj)
+        if not raw_bitmap:
+            return False
+        bitmap = pdfium.PdfBitmap.from_raw(raw_bitmap)
+        with bitmap.to_pil() as original:
+            return _smooth_image_background_pixels(original)
+    except Exception:
+        # 证据读取失败保留图像，不能因损坏对象或不支持的编码删除内容。
+        return False
+    finally:
+        if bitmap is not None:
+            bitmap.close()
+
+
+def _smooth_image_background_pixels(original):
+    """独立 RGB 缓冲沿用 Pillow 默认缩放、色差阈值和计数顺序，不修改输入像素。"""
+    with original.convert("RGB") as rgb, rgb.resize((64, 64)) as small:
+        pixels = list(small.get_flattened_data() if hasattr(small, "get_flattened_data") else small.getdata())
+    differences = [
+        max(abs(a - b) for a, b in zip(pixels[y * 64 + x], pixels[(y + dy) * 64 + x + dx]))
+        for y in range(63)
+        for x in range(63)
+        for dx, dy in ((1, 0), (0, 1))
+    ]
+    return sum(value > 12 for value in differences) / len(differences) <= 0.015
+
+
+_IMAGE_VISUAL_REFERENCE_FUNCTIONS = (_is_smooth_page_background, _native_image_blank_top_bbox)
+
+
+def _image_visual_evidence(raw_obj, page, matrix, image_bbox, page_bbox, page_rotation):
+    """同时符合两种像素检查条件时只解码一次，所有转换缓冲独立并在页面锁内释放。"""
+    shared = _shared_image_visual_evidence(raw_obj, page, matrix, image_bbox, page_bbox, page_rotation)
+    if shared is not None:
+        return shared
+    return (
+        _is_smooth_page_background(raw_obj, page, image_bbox, page_bbox),
+        _native_image_blank_top_bbox(raw_obj, page, matrix, image_bbox, page_bbox, page_rotation),
+    )
+
+
+def _shared_image_visual_evidence(raw_obj, page, matrix, image_bbox, page_bbox, page_rotation):
+    """只复用成功解码的只读原图；不支持、损坏或替换参考函数时各自执行旧路径。"""
+    if (_is_smooth_page_background, _native_image_blank_top_bbox) != _IMAGE_VISUAL_REFERENCE_FUNCTIONS:
+        return None
+    area = max(0.0, page_bbox[2] - page_bbox[0]) * max(0.0, page_bbox[3] - page_bbox[1])
+    if (
+        area <= 0
+        or (image_bbox[2] - image_bbox[0]) * (image_bbox[3] - image_bbox[1]) < 0.95 * area
+        or page_rotation != 0
+        or matrix[0] <= 0
+        or matrix[3] <= 0
+        or abs(matrix[1]) + abs(matrix[2]) > 1e-6
+    ):
+        return None
+    full = _image_bbox_from_matrix(matrix, page_bbox, page_rotation)
+    if full is None or abs(full[1] - image_bbox[1]) > 0.5:
+        return None
+    bitmap = None
+    try:
+        metadata = pdfium_c.FPDF_IMAGEOBJ_METADATA()
+        if (
+            not pdfium_c.FPDFImageObj_GetImageMetadata(raw_obj, page, ctypes.byref(metadata))
+            or not 0 < metadata.width * metadata.height <= 4_000_000
+        ):
+            return None
+        raw_bitmap = pdfium_c.FPDFImageObj_GetBitmap(raw_obj)
+        if not raw_bitmap:
+            return None
+        bitmap = pdfium.PdfBitmap.from_raw(raw_bitmap)
+        with bitmap.to_pil() as original:
+            try:
+                smooth = _smooth_image_background_pixels(original)
+            except Exception:
+                smooth = False
+            try:
+                fraction = _blank_image_top_fraction(original)
+                top = full[1] + fraction * (full[3] - full[1])
+                blank_top = (image_bbox[0], top, image_bbox[2], image_bbox[3]) if fraction and top < image_bbox[3] else None
+            except Exception:
+                blank_top = None
+        return smooth, blank_top
+    except Exception:
+        return None
+    finally:
+        if bitmap is not None:
+            bitmap.close()
+
+
 def _extract_page_form_bboxes(
     page: pdfium.PdfPage,
     page_bbox: BBox,
     page_rotation: int,
+    *,
+    extent_cache: _FormExtentCache | None = None,
 ) -> list[BBox]:
     """在调用方持有 PDFium 锁时提取顶层 Form bbox，并隔离单对象异常。"""
 
@@ -982,7 +947,7 @@ def _extract_page_form_bboxes(
     for raw_obj in _iter_raw_root_form_objects(page):
         try:
             form_bbox = _form_bbox_from_object(raw_obj, page_bbox, page_rotation)
-            clipped = _clipped_form_extent(raw_obj, page_bbox, page_rotation)
+            clipped = _shared_clipped_form_extent(raw_obj, page_bbox, page_rotation, extent_cache)
             if form_bbox is not None and clipped is not None:
                 form_bbox = _intersect_object_bbox(form_bbox, clipped)
                 if form_bbox[2] <= form_bbox[0] or form_bbox[3] <= form_bbox[1]:
@@ -997,59 +962,51 @@ def _extract_page_form_bboxes(
 
 def _extract_page_path_infos(page: pdfium.PdfPage, page_bbox: BBox, page_rotation: int) -> list[PDFPathInfo]:
     """复用含裁剪的统一提取，确保直接查询和快照一致。"""
-    return _extract_page_paths_and_lines(page, page_bbox, page_rotation)[1]
+    return _extract_page_paths_and_lines(page, page_bbox, page_rotation, want_lines=False)[1]
 
 
 def _extract_page_paths_and_lines(
     page: pdfium.PdfPage,
     page_bbox: BBox,
     page_rotation: int,
+    *,
+    want_lines: bool = True,
+    want_path_infos: bool = True,
 ) -> tuple[list[PDFDrawingLine], list[PDFPathInfo]]:
-    """一次遍历和解码 Path，分别隔离绘图线与路径信息的派生异常。"""
+    """一次原生遍历与解码 Path，Python 仅包装路径摘要并合并共线输出。"""
+    from ._object_bridge import read_path_evidence
 
-    drawing_lines: list[PDFDrawingLine] = []
-    path_infos: list[PDFPathInfo] = []
-    for source_index, member in enumerate(_clipped_objects_of_type(page, pdfium_c.FPDF_PAGEOBJ_PATH)):
-        raw_obj, matrix, form_depth = member.raw, member.matrix, member.depth
-        try:
-            subpaths = _read_raw_path_subpaths(raw_obj)
-        except Exception:
-            continue
-        try:
-            for line in _extract_path_drawing_lines(raw_obj, matrix, page_bbox, page_rotation, subpaths=subpaths):
-                clipped = _clip_object_visual_bbox(line.bbox, member.clip, page_bbox, page_rotation)
-                if clipped is not None:
-                    if clipped == line.bbox:
-                        drawing_lines.append(line)
-                    else:
-                        if line.orientation == "horizontal":
-                            y = min(clipped[3], max(clipped[1], line.start[1]))
-                            start, end = (clipped[0], y), (clipped[2], y)
-                        else:
-                            x = min(clipped[2], max(clipped[0], line.start[0]))
-                            start, end = (x, clipped[1]), (x, clipped[3])
-                        drawing_lines.append(replace(line, bbox=clipped, start=start, end=end))
-        except Exception:
-            pass
-        try:
-            info = _path_info_from_object(
-                raw_obj,
-                matrix,
-                page_bbox,
-                page_rotation,
-                form_depth,
-                source_index,
-                subpaths=subpaths,
-            )
-        except Exception:
-            continue
-        if info is not None:
-            clipped = _clip_object_visual_bbox(info.bbox, member.clip, page_bbox, page_rotation)
-            if clipped is not None:
-                path_infos.append(info if clipped == info.bbox else replace(info, bbox=clipped))
-    return _merge_collinear_drawing_lines(drawing_lines, _drawing_page_size(page_bbox, page_rotation)), path_infos
+    native_lines, native_infos = read_path_evidence(
+        page,
+        page_bbox,
+        page_rotation,
+        DRAWING_FORM_MAX_DEPTH,
+        want_lines=want_lines,
+        want_path_infos=want_path_infos,
+    )
+    drawing_lines = [
+        PDFDrawingLine(start, end, bbox, width, "horizontal" if orientation == 0 else "vertical")
+        for start, end, bbox, width, orientation in native_lines
+    ]
+    path_infos = [PDFPathInfo(*record[:7], tuple(record[7])) for record in native_infos]
+    return (
+        _merge_collinear_drawing_lines(drawing_lines, _drawing_page_size(page_bbox, page_rotation))
+        if want_lines
+        else drawing_lines,
+        path_infos,
+    )
 
 
 def _extract_page_drawing_lines(page: pdfium.PdfPage, page_bbox: BBox, page_rotation: int) -> list[PDFDrawingLine]:
     """复用统一裁剪，避免独立线查询重新暴露被 Form 隐藏的路径。"""
-    return _extract_page_paths_and_lines(page, page_bbox, page_rotation)[0]
+    from ._object_bridge import read_drawing_lines
+
+    records = read_drawing_lines(page, page_bbox, page_rotation)
+    if records is not None:
+        # 原生层只构建未合并轴线；共线合并继续沿用 Python 的稳定输出规则。
+        lines = [
+            PDFDrawingLine(start, end, bbox, width, "horizontal" if orientation == 0 else "vertical")
+            for start, end, bbox, width, orientation in records
+        ]
+        return _merge_collinear_drawing_lines(lines, _drawing_page_size(page_bbox, page_rotation))
+    return _extract_page_paths_and_lines(page, page_bbox, page_rotation, want_path_infos=False)[0]

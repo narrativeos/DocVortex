@@ -7,6 +7,7 @@ from collections import defaultdict
 from typing import Any
 
 from ....document.pdf.text._contracts import Char
+from ....document.pdf.text.spacing import needs_tight_space, _tight_space_candidates, _TIGHT_CANDIDATE_REFERENCES
 from ....schema import BBox
 from ._script_geometry import ScriptRole
 from ._table_recovery.candidate import serialize_native_table_html
@@ -19,12 +20,30 @@ from ._table_recovery.contracts import (
     NativeTableText,
 )
 from ._table_recovery.geometry import page_bbox_to_table_local
-from ._table_recovery.text import build_cell_text_parts
+from ._table_recovery.text import build_cell_text_parts, cell_text_rows, cell_writing_angle
 from .geometry import _bbox_union_many, _coerce_bbox
-from .inline.scripts import _fraction_member_indices, _script_line_char_roles
+from .inline.scripts import (
+    _classify_script_runs,
+    _fraction_member_indices,
+    _prepare_fraction_rules,
+    _script_line_char_roles,
+)
+from .inline.detection import _char_font_styles, _pdf_font_metadata
+from .inline.types import PDF_FONT_ITALIC_FLAG
 from .line_merging import _merge_overlapping_inline_text_clusters
 from .models import _LineItem
 from .native_text import _fill_native_typography
+
+_OWNED_CELL_BATCH_CHAR_LIMIT = 8192
+_owned_cell_batches = 0
+_owned_cell_lines = 0
+_owned_cell_fallbacks = 0
+_TIGHT_GLYPH_SOURCE_SLOT = NativeTableGlyph.source_index
+
+
+def table_script_stats() -> tuple[int, int, int]:
+    """报告表格上下标 owned 批次、命中行数和整批回退数。"""
+    return _owned_cell_batches, _owned_cell_lines, _owned_cell_fallbacks
 
 
 def _table_char_map(chars: tuple[Char, ...]) -> dict[int, Char]:
@@ -62,13 +81,23 @@ def _cell_visual_lines(
 ) -> list[_LineItem]:
     """把一个 cell 的 glyph 按 visual row 转换成正文公式分段使用的行。"""
 
+    relative_angle = cell_writing_angle(glyphs)
+    if relative_angle is None:
+        return []
     grouped: dict[int, list[NativeTableGlyph]] = defaultdict(list)
-    for glyph in glyphs:
-        grouped[glyph.visual_row].append(glyph)
+    if relative_angle:
+        rows, _height = cell_text_rows(glyphs, 1.0)
+        grouped.update(enumerate(rows))
+        angle = (angle + relative_angle) % 360
+    else:
+        for glyph in glyphs:
+            grouped[glyph.visual_row].append(glyph)
 
     lines: list[_LineItem] = []
     for visual_row, row_glyphs in sorted(grouped.items()):
-        ordered = sorted(row_glyphs, key=lambda glyph: (glyph.bbox[0], glyph.bbox[1], glyph.glyph_id))
+        # 输入 glyph 已按 visual_row、x、y 和 glyph_id 排序；分组遍历保持
+        # 该顺序，因此这里不再对同一 visual row 重复执行一次稳定排序。
+        ordered = row_glyphs
         chars = [chars_by_source[glyph.source_index] for glyph in ordered if glyph.source_index in chars_by_source]
         bboxes = [bbox for char in chars if (bbox := _coerce_bbox(char.get("bbox"))) is not None]
         if not chars or not bboxes:
@@ -154,6 +183,18 @@ def _drop_shifted_word_prefixes(chars: list[dict[str, Any]], roles: list[ScriptR
         start = end
 
 
+def _roles_by_source(chars: list[dict[str, Any]], roles: list[ScriptRole]) -> dict[int, ScriptRole]:
+    """按来源编号聚合角色；同源冲突沿用原实现降级为 body。"""
+    output: dict[int, ScriptRole] = {}
+    for char, role in zip(chars, roles, strict=True):
+        char_idx = char.get("char_idx")
+        if not isinstance(char_idx, int) or role == "body":
+            continue
+        previous = output.get(char_idx)
+        output[char_idx] = role if previous in {None, role} else "body"
+    return {source_index: role for source_index, role in output.items() if role != "body"}
+
+
 def _cell_script_roles(
     glyphs: list[NativeTableGlyph],
     chars_by_source: dict[int, Char],
@@ -162,10 +203,12 @@ def _cell_script_roles(
     tight_bboxes: dict[int, BBox],
     origins: dict[int, tuple[float, float]],
     fraction_members: set[int],
+    *,
+    visual_lines: list[_LineItem] | None = None,
 ) -> dict[int, ScriptRole]:
     """在 cell 内按正文同款二维公式分段和字符几何返回稳定角色。"""
 
-    lines = _cell_visual_lines(glyphs, chars_by_source, page_size, angle)
+    lines = _cell_visual_lines(glyphs, chars_by_source, page_size, angle) if visual_lines is None else visual_lines
     if not lines:
         return {}
     segmented_lines = _merge_overlapping_inline_text_clusters(lines, page_size, [])
@@ -188,13 +231,138 @@ def _cell_script_roles(
     return {source_index: role for source_index, role in roles_by_source.items() if role != "body"}
 
 
+def _owned_cell_line_indices(line: _LineItem, identities: dict[int, int]) -> list[int] | None:
+    """仅普通 0 度、同源且无特殊公式标记的行可进入页面级 owned 批次。"""
+    if (
+        type(line) is not _LineItem
+        or type(line.chars) is not list
+        or line.angle != 0
+        or line.inline_math_regions
+        or line.compact_formula_cluster
+        or line.restored_inline_cluster
+    ):
+        return None
+    indices: list[int] = []
+    for char in line.chars:
+        index = identities.get(id(char)) if type(char) is dict else None
+        if index is None:
+            return None
+        indices.append(index)
+    return indices
+
+
+def _owned_cell_classify(
+    pending: list[tuple[tuple[int, int], list[_LineItem], list[dict[str, Any]], list[int]]],
+    owned_inputs: tuple[Any, dict[int, int]],
+    page_size: tuple[float, float],
+    tight_bboxes: dict[int, BBox],
+    origins: dict[int, tuple[float, float]],
+) -> dict[tuple[int, int], dict[int, ScriptRole]]:
+    """把多个同源 cell 的视觉行合并成有界 owned 批次并保留原精炼规则。"""
+    global _owned_cell_batches, _owned_cell_lines, _owned_cell_fallbacks
+    evidence, identities = owned_inputs
+    output: dict[tuple[int, int], dict[int, ScriptRole]] = {}
+    cell_lines = {key: lines for key, lines, _chars, _indices in pending}
+    records = []
+    for key, lines, _chars, cell_indices in pending:
+        offset = 0
+        for line in lines:
+            width = len(line.chars)
+            records.append((key, line, cell_indices[offset : offset + width]))
+            offset += width
+    start = 0
+    while start < len(records):
+        end = start + 1
+        char_count = len(records[start][2])
+        while end < len(records) and (char_count + len(records[end][2]) <= _OWNED_CELL_BATCH_CHAR_LIMIT or char_count == 0):
+            char_count += len(records[end][2])
+            end += 1
+        batch = records[start:end]
+        flat_indices = [index for _key, _line, indices in batch for index in indices]
+        offsets = [0]
+        for _key, _line, indices in batch:
+            offsets.append(offsets[-1] + len(indices))
+        classified = evidence.classify_indices(flat_indices, offsets)
+        if len(classified) != len(batch) or any(
+            item is None or len(item) != len(indices) for item, (_key, _line, indices) in zip(classified, batch, strict=True)
+        ):
+            fallback_keys = {key for key, _line, _indices in batch}
+            _owned_cell_fallbacks += sum(key in cell_lines for key in fallback_keys)
+            for key in fallback_keys:
+                output[key] = _cell_script_roles_from_lines(cell_lines[key], page_size, tight_bboxes, origins)
+            start = end
+            continue
+        _owned_cell_batches += 1
+        _owned_cell_lines += len(batch)
+        # 表格 cell 与正文行的大二维合并语义不同；原生先给出任何非正文角色时，
+        # 整 cell 回到既有参考判定，只有确定全正文的结果直接复用 owned 批次。
+        fallback_keys = {
+            key
+            for (key, _line, _indices), raw_roles in zip(batch, classified, strict=True)
+            if any(role != 0 for role in raw_roles)
+        }
+        for key in fallback_keys:
+            output.pop(key, None)
+            _owned_cell_fallbacks += 1
+            output[key] = _cell_script_roles_from_lines(cell_lines[key], page_size, tight_bboxes, origins)
+        for (key, line, _indices), raw_roles in zip(batch, classified, strict=True):
+            if key in fallback_keys:
+                continue
+            roles_by_source = output.setdefault(key, {})
+            chars = line.chars
+            memberships = [None] * len(chars)
+            roles, _body_counts, _formula_flags = _classify_script_runs(
+                chars,
+                tight_bboxes,
+                origins,
+                memberships,
+                preclassified_native=[raw_roles],
+            )
+            _drop_shifted_word_prefixes(chars, roles)
+            for char, role in zip(chars, roles, strict=True):
+                char_idx = char.get("char_idx")
+                if not isinstance(char_idx, int) or role == "body":
+                    continue
+                previous = roles_by_source.get(char_idx)
+                roles_by_source[char_idx] = role if previous in {None, role} else "body"
+        start = end
+    for key, roles in list(output.items()):
+        output[key] = {source_index: role for source_index, role in roles.items() if role != "body"}
+    return output
+
+
+def _cell_script_roles_from_lines(
+    lines: list[_LineItem],
+    page_size: tuple[float, float],
+    tight_bboxes: dict[int, BBox],
+    origins: dict[int, tuple[float, float]],
+) -> dict[int, ScriptRole]:
+    """以已缓存的 cell 视觉行执行参考路径，避免 owned 不可用时重复组行。"""
+    return _cell_script_roles(
+        [],
+        {},
+        page_size,
+        0,
+        tight_bboxes,
+        origins,
+        set(),
+        visual_lines=lines,
+    )
+
+
 def _render_styled_cell(
     cell: NativeTableCell,
     glyphs: list[NativeTableGlyph],
     median_height: float,
     roles: dict[int, ScriptRole],
+    *,
+    chars_by_source: dict[int, Char] | None = None,
+    tight_bboxes: dict[int, BBox] | None = None,
+    origins: dict[int, tuple[float, float]] | None = None,
+    preserve_font_styles: bool = False,
+    _possible_space_indices: set[int] | None = None,
 ) -> str:
-    """按旧文本重建规则安全插入平坦的 sup/sub 标签。"""
+    """按原字符来源安全插入上下标及可选的粗斜体，文字不匹配时保持转义回退。"""
 
     parts = build_cell_text_parts(glyphs, median_height)
     if "".join(text for text, _source_index in parts) != cell.content:
@@ -202,15 +370,20 @@ def _render_styled_cell(
 
     rendered: list[str] = []
     active_role: ScriptRole = "body"
+    active_styles = (False, False)
     active_parts: list[str] = []
 
     def flush() -> None:
-        """提交当前同角色片段，并只生成受信的上下标标签。"""
+        """提交同角色同字体样式片段，仅生成固定标签并转义原文。"""
 
         nonlocal active_parts
         if not active_parts:
             return
         content = html.escape("".join(active_parts), quote=False)
+        if active_styles[1]:
+            content = f"<i>{content}</i>"
+        if active_styles[0]:
+            content = f"<b>{content}</b>"
         if active_role == "sup":
             rendered.append(f"<sup>{content}</sup>")
         elif active_role == "sub":
@@ -219,12 +392,33 @@ def _render_styled_cell(
             rendered.append(content)
         active_parts = []
 
+    previous_source = None
     for text, source_index in parts:
         role = roles.get(source_index, "body") if source_index is not None else "body"
-        if role != active_role:
+        styles = active_styles if source_index is None else (False, False)
+        if preserve_font_styles and chars_by_source is not None and source_index in chars_by_source:
+            char = chars_by_source[source_index]
+            styles = ("bold" in _char_font_styles(char), bool(_pdf_font_metadata(char)[1] & PDF_FONT_ITALIC_FLAG))
+        if (
+            chars_by_source is not None
+            and role == active_role == "body"
+            and previous_source in chars_by_source
+            and source_index in chars_by_source
+            and (_possible_space_indices is None or source_index in _possible_space_indices)
+            and needs_tight_space(
+                chars_by_source[previous_source],
+                chars_by_source[source_index],
+                tight_bboxes=tight_bboxes,
+                origins=origins,
+            )
+        ):
+            active_parts.append(" ")
+        if role != active_role or styles != active_styles:
             flush()
             active_role = role
+            active_styles = styles
         active_parts.append(text)
+        previous_source = source_index
     flush()
     return "".join(rendered)
 
@@ -234,6 +428,9 @@ def render_native_table_html_with_scripts(
     table_input: NativeTableInput,
     tight_bboxes: dict[int, BBox],
     origins: dict[int, tuple[float, float]],
+    *,
+    _owned_script_inputs: tuple[Any, dict[int, int]] | None = None,
+    preserve_font_styles: bool = False,
 ) -> str:
     """为高置信原生表格恢复上下标，证据不足时返回原始 HTML。"""
 
@@ -243,10 +440,21 @@ def render_native_table_html_with_scripts(
         return result.html
     chars_by_source = _table_char_map(table_input.chars)
     fraction_rules = _non_grid_fraction_rules(table_input, result)
+    prepared_fraction_rules = _prepare_fraction_rules(fraction_rules, table_input.page_size, table_input.angle)
     # 一张表只建立一次来源索引；保持原字典推导式的后项覆盖语义。
     glyph_by_source = {glyph.source_index: glyph for glyph in result.text.glyphs}
     cell_glyphs = {(cell.row, cell.col): _cell_glyphs(result, cell, glyph_by_source) for cell in result.cells}
-    cell_roles: dict[tuple[int, int], dict[int, ScriptRole]] = {}
+    cell_lines = {
+        (cell.row, cell.col): _cell_visual_lines(
+            cell_glyphs[(cell.row, cell.col)],
+            chars_by_source,
+            table_input.page_size,
+            table_input.angle,
+        )
+        for cell in result.cells
+    }
+    owned_pending: list[tuple[tuple[int, int], list[_LineItem], list[dict[str, Any]], list[int]]] = []
+    fallback_cells: list[tuple[tuple[int, int], set[int]]] = []
     for cell in result.cells:
         key = (cell.row, cell.col)
         glyphs = cell_glyphs[key]
@@ -257,19 +465,80 @@ def render_native_table_html_with_scripts(
             tight_bboxes,
             fraction_rules,
             table_input.angle,
+            prepared_fraction_rules,
         )
+        lines = cell_lines[key]
+        indices = None
+        if _owned_script_inputs is not None and table_input.angle == 0 and not fraction_members and lines:
+            # owned 批次必须消费与参考路径完全相同的二维合并后的行。
+            segmented = _merge_overlapping_inline_text_clusters(lines, table_input.page_size, [])
+            packed = [
+                (line, line_indices)
+                for line in segmented
+                if (line_indices := _owned_cell_line_indices(line, _owned_script_inputs[1])) is not None
+            ]
+            if len(packed) == len(segmented):
+                indices = [index for _line, row_indices in packed for index in row_indices]
+                chars = [char for line in segmented for char in line.chars]
+                owned_pending.append((key, segmented, chars, indices))
+        if indices is None:
+            fallback_cells.append((key, fraction_members))
+
+    owned_roles = (
+        _owned_cell_classify(
+            owned_pending,
+            _owned_script_inputs,
+            table_input.page_size,
+            tight_bboxes,
+            origins,
+        )
+        if owned_pending
+        else {}
+    )
+    cell_roles: dict[tuple[int, int], dict[int, ScriptRole]] = dict(owned_roles)
+    for key, fraction_members in fallback_cells:
         roles = _cell_script_roles(
-            glyphs,
+            cell_glyphs[key],
             chars_by_source,
             table_input.page_size,
             table_input.angle,
             tight_bboxes,
             origins,
             fraction_members,
+            visual_lines=cell_lines[key],
         )
         if roles:
             cell_roles[key] = roles
-    if not cell_roles:
+
+    # 仅复用当前表格文字与源索引的必要条件；最终角色、几何和认领仍逐阶段判断。
+    possible_space_indices = (
+        _tight_space_candidates(chars_by_source, result.text.glyphs, NativeTableGlyph)
+        if needs_tight_space is _TIGHT_CANDIDATE_REFERENCES[0]
+        and NativeTableGlyph.__getattribute__ is object.__getattribute__
+        and NativeTableGlyph.source_index is _TIGHT_GLYPH_SOURCE_SLOT
+        else None
+    )
+    has_missing_space = False
+    for cell in result.cells:
+        key = (cell.row, cell.col)
+        glyphs = cell_glyphs[key]
+        roles = cell_roles.get(key, {})
+        if not has_missing_space:
+            has_missing_space = any(
+                left.visual_row == right.visual_row
+                and roles.get(left.source_index, "body") == roles.get(right.source_index, "body") == "body"
+                and left.source_index in chars_by_source
+                and right.source_index in chars_by_source
+                and (possible_space_indices is None or right.source_index in possible_space_indices)
+                and needs_tight_space(
+                    chars_by_source[left.source_index],
+                    chars_by_source[right.source_index],
+                    tight_bboxes=tight_bboxes,
+                    origins=origins,
+                )
+                for left, right in zip(glyphs, glyphs[1:])
+            )
+    if not cell_roles and not has_missing_space and not preserve_font_styles:
         return result.html
     return serialize_native_table_html(
         result.rows,
@@ -279,6 +548,11 @@ def render_native_table_html_with_scripts(
             cell_glyphs[(cell.row, cell.col)],
             result.text.median_glyph_height,
             cell_roles.get((cell.row, cell.col), {}),
+            chars_by_source=chars_by_source,
+            tight_bboxes=tight_bboxes,
+            origins=origins,
+            preserve_font_styles=preserve_font_styles,
+            _possible_space_indices=possible_space_indices,
         ),
     )
 

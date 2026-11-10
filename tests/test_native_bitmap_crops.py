@@ -1,0 +1,101 @@
+"""位图裁剪差分覆盖通道排列、行填充、旋转、边界与计算错误传播。"""
+
+from copy import deepcopy
+
+import numpy as np
+import pytest
+from PIL import Image
+
+from docvortex._compute_backend import get_native
+from docvortex.document.pdf.visuals import _attach_owned_bitmap_crops, _attach_prepared_visual_block_images
+
+
+@pytest.fixture
+def native():
+    """仅在显式 Python 参考后端下跳过原生算子检查。"""
+    module = get_native()
+    if module is None:
+        pytest.skip("Python reference backend")
+    return module
+
+
+@pytest.mark.parametrize("mode", ["BGR", "BGRX", "BGRA", "RGB", "RGBX", "RGBA", "L"])
+@pytest.mark.parametrize("angle", [0, 90, 180, 270])
+def test_padded_bitmap_crop_matches_pillow(native, mode, angle):
+    """随机像素与非零行填充逐字节比对 Pillow 独立裁剪、旋转及最终 JPEG。"""
+    rng = np.random.default_rng(123)
+    width, height = 37, 29
+    channels = 1 if mode == "L" else len(mode)
+    stride = width * channels + 5
+    data = rng.integers(0, 256, size=height * stride, dtype=np.uint8).tobytes()
+    dest = "L" if mode == "L" else "RGBA" if mode.endswith("A") else "RGB"
+    image = Image.frombytes(dest, (width, height), data, "raw", mode, stride, 1)
+    bbox = (3, 2, 34, 28)
+    rotations = {90: Image.Transpose.ROTATE_90, 180: Image.Transpose.ROTATE_180, 270: Image.Transpose.ROTATE_270}
+    with image.convert("RGB") as rgb, rgb.crop(bbox) as crop:
+        if angle:
+            with crop.transpose(rotations[angle]) as rotated:
+                expected = np.asarray(rotated).copy()
+        else:
+            expected = np.asarray(crop).copy()
+    expected = expected[..., ::-1]
+    pixels, w, h = native.crop_bitmap_bgr(data, width, height, stride, mode, bbox, angle)
+    assert bytes(pixels) == expected.tobytes()
+    assert (h, w) == expected.shape[:2]
+    specs = [[(0, {"bbox": bbox, "angle": angle})]]
+    reference = deepcopy(specs)
+    _attach_prepared_visual_block_images(reference, [{"img_pil": image}])
+    _attach_owned_bitmap_crops(specs[0], (data, width, height, stride, mode), native, 0)
+    assert specs == reference
+    image.close()
+
+
+@pytest.mark.parametrize("bbox", [(0, 0, 0, 2), (0, 0, 5, 2), (2, 2, 1, 1)])
+def test_native_crop_rejects_invalid_bounds(native, bbox):
+    """非法裁剪不能访问缓冲外字节或隐式修正原生调用契约。"""
+    with pytest.raises(ValueError, match="bounds"):
+        native.crop_bitmap_bgr(bytes(48), 4, 4, 12, "BGR", bbox, 0)
+
+
+@pytest.mark.parametrize(
+    "data,stride,mode,angle",
+    [(bytes(47), 12, "BGR", 0), (bytes(48), 11, "BGR", 0), (bytes(48), 12, "XYZ", 0), (bytes(48), 12, "BGR", 45)],
+)
+def test_native_crop_rejects_invalid_metadata(native, data, stride, mode, angle):
+    """截断缓冲、非法步长、未知格式与非直角方向必须明确报错。"""
+    with pytest.raises(ValueError):
+        native.crop_bitmap_bgr(data, 4, 4, stride, mode, (0, 0, 4, 4), angle)
+
+
+def test_crop_compute_failure_is_not_silently_skipped(native):
+    """原生计算异常明确传播，不能静默跳过已选视觉素材。"""
+    with pytest.raises(ValueError, match="buffer"):
+        _attach_owned_bitmap_crops([(0, {"bbox": [0, 0, 1, 1]})], (b"", 4, 4, 12, "BGR"), native, 0)
+
+
+@pytest.mark.parametrize("bbox", [[0.05, 0.1, 0.9, 0.85], [-1, 1, 8, 8]])
+def test_crop_normalization_matches_reference(native, bbox):
+    """有效归一化框和部分越界框在两条路径上保持一致裁剪结果。"""
+    image = Image.new("RGB", (4, 5), (20, 30, 40))
+    specs = [[(0, {"bbox": bbox, "angle": -90})]]
+    expected = deepcopy(specs)
+    _attach_prepared_visual_block_images(expected, [{"img_pil": image}])
+    _attach_owned_bitmap_crops(specs[0], (image.tobytes(), 4, 5, 12, "RGB"), native, 0)
+    assert specs[0][0][1].get("image_base64") == expected[0][0][1].get("image_base64")
+    image.close()
+
+
+@pytest.mark.parametrize("bbox", [None, [], [float("nan"), 0, 1, 1], [-3, -3, -1, -1], [0.5, 0.5, 0.5, 0.8]])
+def test_invalid_selected_crop_reports_context_in_both_paths(native, bbox):
+    """已选素材的无效、非有限、完全越界和零面积框在两条路径都带上下文报错。"""
+    with Image.new("RGB", (4, 5), (20, 30, 40)) as image:
+        specs = [[(2, {"type": "image", "bbox": bbox, "angle": -90})]]
+        reference = deepcopy(specs)
+        with pytest.raises(ValueError, match="generation failed: page=3, block=2") as eager_failure:
+            _attach_prepared_visual_block_images(reference, [{"img_pil": image}], page_start_index=3)
+        with pytest.raises(ValueError, match="geometry invalid: page=3, block=2") as native_failure:
+            _attach_owned_bitmap_crops(specs[0], (image.tobytes(), 4, 5, 12, "RGB"), native, 3)
+        assert eager_failure.value.__cause__ is not None
+        assert native_failure.value.__cause__ is not None
+        assert "image_base64" not in reference[0][0][1]
+        assert "image_base64" not in specs[0][0][1]

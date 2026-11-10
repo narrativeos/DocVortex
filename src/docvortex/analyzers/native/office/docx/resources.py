@@ -7,6 +7,7 @@ from docx.oxml.xmlchemy import BaseOxmlElement
 from docx.text.paragraph import Paragraph
 from loguru import logger
 from ..ooxml_chart import extract_chart_html_from_ooxml
+from .....errors import ResourceLimitError
 from ..image import serialize_office_image
 from ..equation.ooxml import is_mathtype_equation_prog_id
 from ..equation.omml import oMath2Latex
@@ -137,11 +138,11 @@ class _DocxResources:
             blob = image_part.blob
         except (AttributeError, KeyError, ValueError):
             return None
-        return self._image_equation_decoder.decode(
+        return self._image_equation_decoder.probe(
             blob,
             part_name=getattr(image_part, "partname", None),
             content_type=getattr(image_part, "content_type", None),
-        )
+        ).latex
 
     @staticmethod
     def _select_docx_compatibility_tokens(
@@ -276,6 +277,7 @@ class _DocxResources:
 
             img_base64 = serialize_office_image(
                 image_part.blob,
+                equation_decoder=self._image_equation_decoder,
                 part_name=getattr(image_part, "partname", None),
                 content_type=getattr(image_part, "content_type", None),
             )
@@ -286,7 +288,33 @@ class _DocxResources:
                 "type": BlockType.IMAGE,
                 "image_base64": img_base64,
             }
+            alt_text = self._docx_image_alt_text(image)
+            if alt_text:
+                image_block["content"] = alt_text
             self.cur_page.append(image_block)
+
+    @staticmethod
+    def _docx_image_alt_text(image: Any) -> str:
+        """读取 DrawingML wp:docPr 的 descr 或 VML v:shape 的 alt 替代文本。"""
+        element = image
+        while element is not None:
+            tag = str(getattr(element, "tag", ""))
+            local_name = tag.rsplit("}", 1)[-1]
+            if local_name in {"inline", "anchor"}:
+                for child in element:
+                    child_tag = str(getattr(child, "tag", ""))
+                    if child_tag.rsplit("}", 1)[-1] == "docPr":
+                        descr = (child.get("descr") or "").strip()
+                        if descr:
+                            return descr
+                return ""
+            if local_name == "shape" and "urn:schemas-microsoft-com:vml" in tag:
+                alt = (element.get("alt") or "").strip()
+                if alt:
+                    return alt
+                return ""
+            element = element.getparent()
+        return ""
 
     def _handle_drawingml(self, elements: list[BaseOxmlElement]):
         """
@@ -348,6 +376,8 @@ class _DocxResources:
 
             try:
                 chart_html = extract_chart_html_from_ooxml(chart_xml, workbook_bytes)
+            except ResourceLimitError:
+                raise
             except Exception as e:
                 logger.warning(f"Warning: chart HTML cannot be extracted: {e}")
                 continue

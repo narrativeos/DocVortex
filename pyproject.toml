@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77.0.3", "wheel"]
+requires = ["setuptools>=77.0.3", "wheel", "setuptools-rust>=1.11,<2"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,12 +7,11 @@ name = "docvortex"
 dynamic = ["version"]
 description = "A fast, multi-format document parsing and conversion engine"
 readme = "README.md"
-requires-python = ">=3.10,<3.15"
-license = "MIT"
+requires-python = ">=3.11,<3.15"
+license = "MIT AND Apache-2.0 AND BSD-3-Clause"
 license-files = ["LICENSE.md"]
 classifiers = [
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -20,19 +19,23 @@ classifiers = [
 ]
 dependencies = [
     "click>=8.1.7", "loguru>=0.7.2", "numpy>=1.21.6", "pillow>=11.0.0",
-    "pypdfium2>=5.10.1,<6", "pypdf>=5.6.0", "pydantic>=2.12.5,<3",
+    "pypdfium2>=5.13.0,<6", "pypdf>=5.6.0", "pydantic>=2.12.5,<3",
     "metafile-render>=0.3.0,<1.0.0", "ftfy>=6.3.1,<7", "fonttools>=4,<5",
     "beautifulsoup4>=4.13.5,<5", "lxml>=4,<7", "nh3>=0.3.6,<0.4",
     "python-docx>=1.2.0,<2", "pypptx-with-oxml>=1.0.3,<2",
     "mammoth>=1.11.0,<2", "openpyxl>=3.1.5,<4", "olefile>=0.47,<1",
     "pylatexenc>=2.10,<3", "latex2mathml>=3.81.0,<4", "mathml2omml==0.0.2",
     "resvg_py>=0.5.0,<0.6",
-    "reportlab[accel]", "ziamath>=0.13,<0.14",
-    "magika>=0.6.2,<1.1.0", "opencv-python>=4.11.0.86",
+    "reportlab; sys_platform == 'win32' and (platform_machine == 'ARM64' or platform_machine == 'arm64' or platform_machine == 'aarch64')",
+    "reportlab[accel]; sys_platform != 'win32' or (platform_machine != 'ARM64' and platform_machine != 'arm64' and platform_machine != 'aarch64')",
+    "ziamath>=0.13,<0.14",
+    "mineru-magika>=1.0.3,<1.1.0",
+    "onnxruntime-directml>=1.24.4,<2; sys_platform == 'win32' and (platform_machine == 'AMD64' or platform_machine == 'amd64' or platform_machine == 'x86_64')",
+    "onnxruntime>=1.24.4,<2; sys_platform != 'win32' or (platform_machine != 'AMD64' and platform_machine != 'amd64' and platform_machine != 'x86_64')",
 ]
 
 [project.optional-dependencies]
-test = ["pytest", "pytest-cov", "pytest-xdist>=3.8,<4", "markdown", "jsonschema>=4,<5"]
+test = ["pytest", "pytest-cov", "pytest-xdist>=3.8,<4", "markdown", "jsonschema>=4,<5", "packaging", "psutil"]
 dev = ["ruff==0.14.2", "build", "twine"]
 
 [project.urls]
@@ -59,4 +62,4 @@ pythonpath = ["tests", "tests/unittest", "."]
 
 [tool.ruff]
 line-length = 128
-target-version = "py310"
+target-version = "py311"

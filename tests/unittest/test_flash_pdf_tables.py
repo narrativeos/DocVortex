@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from docvortex.analyzers.native.pdf import geometry, models, table_materialization, tables
+from docvortex.analyzers.native.pdf import geometry, models, table_annotations, table_materialization, table_rules, tables
 from docvortex.document.pdf._document import PDFPathInfo
 
 
@@ -581,12 +581,10 @@ def test_disconnected_stacked_rule_grids_remain_separate() -> None:
 
     grid_bboxes = tables._connected_rule_grid_bboxes(axis_lines, 5.0)
 
-    assert grid_bboxes == pytest.approx(
-        [
-            (0.0, 8.0, 110.0, 58.1),
-            (0.0, 90.0, 110.0, 140.1),
-        ]
-    )
+    assert grid_bboxes == [
+        pytest.approx((0.0, 8.0, 110.0, 58.1)),
+        pytest.approx((0.0, 90.0, 110.0, 140.1)),
+    ]
 
 
 def _closed_sparse_grid_fixture(
@@ -891,6 +889,80 @@ def test_rule_table_candidate_accepts_captionless_regular_text_distribution() ->
     assert candidates[0].line_indices == set(range(9))
 
 
+@pytest.mark.parametrize("centered", (False, True))
+def test_deferred_rule_candidates_match_eager_merge(monkeypatch, centered):
+    """确认排序前没有物化候选，最终合并的框、成员、评分和注释完全相同。"""
+    import pickle
+
+    rows, lines, rules = _rule_table_fixture(centered_columns=centered)
+    before = pickle.dumps((rows, lines, rules))
+    args = (rows, lines, (150.0, 100.0), 0, 5.0, rules)
+    expected = table_rules._merge_table_candidates(table_rules._build_rule_table_candidates(*args))
+    original = table_rules._expand_rule_table_candidate
+    calls = []
+
+    def materialize(*args, **kwargs):
+        """只记录真正候选物化时机，不修改构造参数。"""
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(table_rules, "_expand_rule_table_candidate", materialize)
+    drafts = table_rules._build_rule_table_candidates(*args, defer_materialization=True)
+    assert drafts and not calls
+    assert table_rules._merge_table_candidates(drafts) == expected
+    assert len(calls) == len(drafts)
+    assert pickle.dumps((rows, lines, rules)) == before
+
+
+def test_deferred_rule_candidates_share_frozen_grid_components(monkeypatch):
+    """确认延迟候选冻结的网格分量可被闭合网格检测复用而不重复扫描。"""
+    rows, lines, axis_lines = _rule_table_fixture()
+    original = table_rules._connected_rule_grid_components
+    calls = []
+
+    def counted(*args, **kwargs):
+        """只计数连通分量重建次数，不改变任何几何结果。"""
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(table_rules, "_connected_rule_grid_components", counted)
+    drafts = table_rules._build_rule_table_candidates(
+        rows,
+        lines,
+        (150.0, 100.0),
+        0,
+        5.0,
+        axis_lines,
+        defer_materialization=True,
+    )
+    assert drafts
+    assert len(calls) == 1
+    shared = drafts[0].context.grid_components
+    assert shared is not None
+    closed = table_rules._build_closed_rule_grid_candidates(
+        rows,
+        lines,
+        (150.0, 100.0),
+        0,
+        5.0,
+        axis_lines,
+        [],
+        None,
+        grid_components=shared,
+    )
+    assert len(calls) == 1
+    assert closed == table_rules._build_closed_rule_grid_candidates(
+        rows,
+        lines,
+        (150.0, 100.0),
+        0,
+        5.0,
+        axis_lines,
+        [],
+        None,
+    )
+
+
 def test_rule_table_candidate_accepts_center_aligned_columns_with_varying_widths() -> None:
     """验证左右边界变化但中心稳定的两列表格仍可形成候选。"""
 
@@ -1101,6 +1173,164 @@ def test_duplicate_horizontal_paths_count_as_one_boundary() -> None:
     assert len(groups[0]) == 2
     assert [line.bbox[1] for line in groups[0]] == [10.0, 30.0]
     assert tables._group_long_horizontal_rules(axis_lines[:2], 5.0) == []
+
+
+def test_rule_spans_keep_historical_exhaustive_order() -> None:
+    """验证横线候选完整保留旧版 first/bottom 枚举顺序，不删除内部子区间。"""
+
+    assert list(table_rules._iter_rule_spans(5)) == [
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (0, 4),
+        (1, 2),
+        (1, 3),
+        (1, 4),
+        (2, 3),
+        (2, 4),
+        (3, 4),
+    ]
+
+
+def test_shared_line_index_set_matches_builtin_set_mutations() -> None:
+    """验证共享基底集合在候选增删与同基底合并时与普通 set 完全一致。"""
+
+    base = frozenset({1, 2, 3})
+    shared = models._SharedLineIndexSet(base, {4})
+    expected = {1, 2, 3, 4}
+
+    shared.difference_update({2, 4})
+    expected.difference_update({2, 4})
+    shared.add(4)
+    expected.add(4)
+    shared.discard(1)
+    expected.discard(1)
+    assert set(shared) == expected
+    assert len(shared) == len(expected)
+
+    other = models._SharedLineIndexSet(base, {5})
+    other.difference_update({3})
+    expected_other = ({1, 2, 3} | {5}) - {3}
+    shared.update(other)
+    expected.update(expected_other)
+
+    assert set(shared) == expected
+    assert shared == expected
+
+
+def test_shared_line_index_set_exact_conversion_preserves_plain_target_union() -> None:
+    """验证普通候选转入共享基底后，合并结果不会错误补回候选已删除的基底成员。"""
+
+    base = frozenset({1, 2, 3})
+    shared = models._SharedLineIndexSet(base, {5})
+    shared.discard(2)
+    plain = models._TableCandidate(
+        bbox=(0.0, 0.0, 10.0, 10.0),
+        local_bbox=(0.0, 0.0, 10.0, 10.0),
+        angle=0,
+        score=10.0,
+        line_indices={1, 4},
+    )
+    candidate = models._TableCandidate(
+        bbox=(0.0, 0.0, 10.0, 10.0),
+        local_bbox=(0.0, 0.0, 10.0, 10.0),
+        angle=0,
+        score=1.0,
+        line_indices=shared,
+    )
+
+    merged = table_rules._merge_table_candidates([plain, candidate])
+
+    assert len(merged) == 1
+    assert merged[0].line_indices == {1, 3, 4, 5}
+
+
+def test_rule_interval_partition_matches_historical_closed_interval_scan() -> None:
+    """验证一次分桶与旧版闭区间逐段扫描完全一致，边界行同时属于相邻两段。"""
+
+    rules = [_axis_line("horizontal", (0.0, y, 100.0, y + 0.1)) for y in (10.0, 20.0, 30.0)]
+    rows = [
+        models._VisualRow(
+            fragments=[
+                models._Fragment(
+                    str(index),
+                    (10.0, center_y - 1.0, 20.0, center_y + 1.0),
+                    (10.0, center_y - 1.0, 20.0, center_y + 1.0),
+                    index,
+                    index,
+                )
+            ],
+            center_y=center_y,
+            bbox=(10.0, center_y - 1.0, 20.0, center_y + 1.0),
+            visual_row_id=index,
+        )
+        for index, center_y in enumerate((10.05, 15.0, 20.05, 25.0, 30.05))
+    ]
+
+    actual = table_rules._partition_rows_by_rule_intervals(rows, rules)
+    expected = [
+        [
+            row
+            for row in rows
+            if geometry._bbox_center_y(top_rule.bbox) <= row.center_y <= geometry._bbox_center_y(bottom_rule.bbox)
+        ]
+        for top_rule, bottom_rule in zip(rules, rules[1:])
+    ]
+
+    assert actual == expected
+    assert rows[2] in actual[0]
+    assert rows[2] in actual[1]
+
+
+def test_rule_corridor_cache_matches_uncached_interval_projection() -> None:
+    """验证精确走廊缓存只复用横向裁剪，不改变纵向准入和输出视觉行。"""
+
+    rows, _lines, _axis_lines = _rule_table_fixture()
+    cache: dict[tuple[float, float], list[table_rules._RuleCorridorRow]] = {}
+    row_index = table_rules._build_row_interval_index(rows)
+    intervals = [
+        (0.0, 8.0, 110.0, 20.1),
+        (0.0, 8.0, 110.0, 32.1),
+        (0.0, 20.0, 110.0, 32.1),
+    ]
+
+    for rule_bbox in intervals:
+        expected = table_rules._rows_inside_rule_interval(
+            rows,
+            rule_bbox,
+            [],
+            row_index,
+        )
+        actual = table_rules._rows_inside_rule_interval(
+            rows,
+            rule_bbox,
+            [],
+            corridor_cache=cache,
+        )
+        assert actual == expected
+
+    assert len(cache) == 1
+
+
+def test_stable_column_prefix_reuse_matches_full_recomputation() -> None:
+    """验证严格前缀续算在每个增长阶段都与从头聚类完全一致。"""
+
+    rows, _lines, _axis_lines = _rule_table_fixture()
+    cache = table_rules._StableColumnCache()
+
+    for end_index in range(1, len(rows) + 1):
+        current_rows = rows[:end_index]
+        expected = table_rules._count_stable_columns(current_rows, 5.0)
+        actual = table_rules._count_stable_columns(
+            current_rows,
+            5.0,
+            cache,
+            allow_prefix_reuse=True,
+        )
+        assert actual == expected
+
+    assert len(cache.prefixes) == 1
+    assert next(iter(cache.prefixes.values())).row_ids == tuple(id(row) for row in rows)
 
 
 def test_nearest_rule_pair_excludes_header_line_from_table_bbox() -> None:
@@ -1636,6 +1866,69 @@ def test_auxiliary_table_note_requires_neutral_core_reference(
     assert [tables._visual_row_text(row) for row in selected] == [f"{marker} neutral explanation"]
 
 
+def test_prepared_table_note_context_matches_direct_calculation() -> None:
+    """验证走廊行和正文高度预计算与逐次计算得到完全相同的表注结果。"""
+
+    rows, lines, rule_bbox, core_indices, page_size = _table_note_reference_fixture(
+        "q",
+        "compact",
+    )
+    prepared_rows = table_annotations._prepare_table_note_rows(
+        rows,
+        lines,
+        rule_bbox,
+        8.0,
+        page_size,
+        0,
+    )
+    prepared_body_metrics = table_annotations._prepare_table_note_body_metrics(
+        lines,
+        page_size,
+        0,
+    )
+
+    direct_height = table_annotations._table_note_body_reference_height(
+        lines,
+        rule_bbox,
+        8.0,
+        core_indices,
+        page_size,
+        0,
+    )
+    prepared_height = table_annotations._table_note_body_reference_height(
+        lines,
+        rule_bbox,
+        8.0,
+        core_indices,
+        page_size,
+        0,
+        prepared_body_metrics,
+    )
+    direct_rows = tables._collect_footnote_rows(
+        rows,
+        lines,
+        rule_bbox,
+        8.0,
+        core_indices,
+        page_size,
+        0,
+    )
+    prepared_result = tables._collect_footnote_rows(
+        rows,
+        lines,
+        rule_bbox,
+        8.0,
+        core_indices,
+        page_size,
+        0,
+        prepared_rows=prepared_rows,
+        prepared_body_metrics=prepared_body_metrics,
+    )
+
+    assert prepared_height == direct_height
+    assert prepared_result == direct_rows
+
+
 def test_auxiliary_table_note_rejects_marker_without_core_reference() -> None:
     """验证紧邻表格的短标记正文在缺少表内引用时不能启动表注链。"""
 
@@ -1750,6 +2043,32 @@ def test_auxiliary_table_note_requires_smaller_than_body_reference() -> None:
             0,
         )
         == []
+    )
+
+
+def test_table_note_precheck_uses_clipped_corridor_projection() -> None:
+    """验证另一栏普通文本不会遮蔽表格走廊内真实的 Note 起始行。"""
+
+    outside_bbox = (140.0, 51.0, 190.0, 59.0)
+    inside_bbox = (10.0, 51.0, 70.0, 59.0)
+    row = models._VisualRow(
+        fragments=[
+            models._Fragment("ordinary prose", outside_bbox, outside_bbox, 1, 1),
+            models._Fragment("Note: values are adjusted", inside_bbox, inside_bbox, 2, 1),
+        ],
+        center_y=55.0,
+        bbox=geometry._bbox_union(outside_bbox, inside_bbox),
+        visual_row_id=1,
+    )
+
+    assert table_annotations._has_possible_table_note_rows([row]) is False
+    assert (
+        table_annotations._has_possible_table_note_rows_in_corridor(
+            [row],
+            (0.0, 40.0, 100.0, 60.0),
+            8.0,
+        )
+        is True
     )
 
 

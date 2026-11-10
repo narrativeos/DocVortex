@@ -8,10 +8,19 @@ from typing import Any
 
 from .._shared.xycut import sort_entries
 from ....schema import BlockType
-from .geometry import bbox_center, normalize_bbox
+from .geometry import bbox_center, bbox_union, normalize_bbox
 from .models import OfdPageScene, TextLine
 from .table import OfdTableBudget, OfdTableRegion, recover_tables
-from .assembly import line_baseline, line_spans, merge_paragraph_blocks, merge_same_baseline_lines
+from .assembly import (
+    line_baseline,
+    line_spans,
+    merge_paragraph_blocks,
+    merge_same_baseline_lines,
+    merge_source_adjacent_lines,
+    source_inline_order_groups,
+    source_parallel_row_groups,
+    starts_new_article,
+)
 
 _PAGE_NUMBER_RE = re.compile(r"^(?:\d+|[IVXLCDM]+)$", re.IGNORECASE)
 
@@ -90,6 +99,66 @@ def _upright_bbox(bbox: list[float], scene: OfdPageScene, angle: int) -> list[fl
     return [x0, y0, x1, y1]
 
 
+def _restore_inline_order(blocks: list[dict[str, Any]], groups: list[tuple[int, ...]]) -> list[dict[str, Any]]:
+    """合段后仅重排连续的单行正文片段组，不跨过非成员块，也不修改内容或段落组成。"""
+    if not groups:
+        return blocks
+    positions = {
+        block["_source_line_id"]: index
+        for index, block in enumerate(blocks)
+        if block["type"] == BlockType.TEXT and len(block.get("line_bboxes_mm", [])) == 1 and "_source_line_id" in block
+    }
+    output = list(blocks)
+    for group in groups:
+        if any(line_id not in positions for line_id in group):
+            continue
+        indices = [positions[line_id] for line_id in group]
+        start, end = min(indices), max(indices)
+        if end - start + 1 != len(group):
+            continue
+        # 片段组来自互不相交的视觉行链；等长替换只改变本区间内部的顺序。
+        output[start : end + 1] = [blocks[index] for index in indices]
+    return output
+
+
+def _sort_body_with_parallel_rows(
+    blocks: list[dict[str, Any]], scene: OfdPageScene, groups: list[tuple[int, int]]
+) -> list[dict[str, Any]]:
+    """把已确认的并列行暂作整体参与 XYCut，再展开原块以保留内容、类型及几何。"""
+    by_line = {block["_source_line_id"]: block for block in blocks if "_source_line_id" in block}
+    members_by_id: dict[int, list[dict[str, Any]]] = {}
+    for group in groups:
+        if any(line_id not in by_line or line_id in members_by_id for line_id in group):
+            continue
+        members = [by_line[line_id] for line_id in group]
+        if any(block["type"] != BlockType.TEXT or len(block.get("line_bboxes_mm", [])) != 1 for block in members):
+            continue
+        members_by_id.update((line_id, members) for line_id in group)
+    consumed: set[int] = set()
+    sortable: list[dict[str, Any]] = []
+    for block in blocks:
+        if id(block) in consumed:
+            continue
+        members = members_by_id.get(block.get("_source_line_id"), [block])
+        consumed.update(id(member) for member in members)
+        bbox = block["bbox_mm"] if len(members) == 1 else bbox_union([member["bbox_mm"] for member in members])
+        assert bbox is not None
+        upright = _upright_bbox(list(bbox), scene, int(block.get("angle", 0) or 0) % 360)
+        sortable.append({"bbox": [value * 72.0 / 25.4 for value in upright], "members": members})
+    ordered: list[dict[str, Any]] = []
+    previous_parallel = False
+    for entry in sort_entries(sortable):
+        members = entry["members"]
+        parallel = len(members) > 1
+        for member in members:
+            # 并列成员与其后正文不互相续接；复用既有私有边界，防止旋转后公共合段重新拼接。
+            if (parallel or previous_parallel) and member["type"] == BlockType.TEXT:
+                member = {**member, "_paragraph_boundary": True}
+            ordered.append(member)
+            previous_parallel = parallel
+    return ordered
+
+
 class OfdReadingOrderProjector:
     """执行表格认领、辅助类型判定和 OFD-aware XYCut++。"""
 
@@ -130,9 +199,12 @@ class OfdReadingOrderProjector:
             "angle": line.angle,
             "paint_order": line.paint_order,
             "line_bboxes_mm": [line.bbox],
+            "_source_line_id": id(line),
         }
         if level is not None:
             block["level"] = level
+        if block_type == BlockType.TEXT and starts_new_article(line.text):
+            block["_paragraph_boundary"] = True
         return block
 
     def _table_block(self, table: OfdTableRegion) -> dict[str, Any]:
@@ -166,6 +238,20 @@ class OfdReadingOrderProjector:
         consumed = {line_id for table in tables for line_id in table.consumed_line_ids}
         consumed_images = {image_id for table in tables for image_id in table.consumed_image_ids}
         merged_lines = merge_same_baseline_lines([line for line in scene.text_lines if id(line) not in consumed])
+        protected = [
+            line
+            for line in merged_lines
+            if _auxiliary_type(line, scene, self.repeated) is not None or line.font_size >= 1.45 * self.body_size
+        ]
+        barriers = [table.bbox for table in tables] + [image.bbox for image in scene.images] + [line.bbox for line in protected]
+        excluded_line_ids = frozenset(id(line) for line in protected)
+        merged_lines = merge_source_adjacent_lines(
+            merged_lines,
+            barriers=barriers,
+            excluded_line_ids=excluded_line_ids,
+        )
+        inline_order_groups = source_inline_order_groups(merged_lines, barriers=barriers, excluded_line_ids=excluded_line_ids)
+        parallel_row_groups = source_parallel_row_groups(merged_lines, barriers=barriers, excluded_line_ids=excluded_line_ids)
         blocks = [self._text_block(line, scene) for line in merged_lines]
         blocks.extend(self._table_block(table) for table in tables)
         blocks.extend(self._image_block(image) for image in scene.images if id(image) not in consumed_images)
@@ -184,13 +270,9 @@ class OfdReadingOrderProjector:
         ]
         bottom_ids = {id(block) for block in bottom}
         body = [block for block in blocks if id(block) not in top_ids and id(block) not in bottom_ids]
-        sortable: list[dict[str, Any]] = []
-        for block in body:
-            upright = _upright_bbox(list(block["bbox_mm"]), scene, int(block.get("angle", 0) or 0) % 360)
-            sortable.append({"bbox": [value * 72.0 / 25.4 for value in upright], "payload": block})
-        ordered_body = [entry["payload"] for entry in sort_entries(sortable)]
+        ordered_body = _sort_body_with_parallel_rows(body, scene, parallel_row_groups)
         ordered = sorted(top, key=lambda block: (block["bbox_mm"][1], block["bbox_mm"][0], block["paint_order"]))
-        ordered.extend(merge_paragraph_blocks(ordered_body))
+        ordered.extend(_restore_inline_order(merge_paragraph_blocks(ordered_body), inline_order_groups))
         ordered.extend(sorted(bottom, key=lambda block: (block["bbox_mm"][1], block["bbox_mm"][0], block["paint_order"])))
         output: list[dict[str, Any]] = []
         for block in ordered:
@@ -209,6 +291,8 @@ class OfdReadingOrderProjector:
                 result["level"] = block["level"]
             if "image_base64" in block:
                 result["image_base64"] = block["image_base64"]
+            if block.get("_paragraph_boundary"):
+                result["_paragraph_boundary"] = True
             line_bboxes = [normalize_bbox(item, scene.physical_box) for item in block.get("line_bboxes_mm", [])]
             valid_line_bboxes = [item for item in line_bboxes if item is not None]
             if valid_line_bboxes:

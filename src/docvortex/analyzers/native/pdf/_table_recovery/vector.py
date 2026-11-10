@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .candidate import GridCellSpec, build_candidate
@@ -53,12 +53,26 @@ class _IndexedRules(list[_MergedRule]):
     def __init__(self, rules: list[_MergedRule]) -> None:
         """按方向分组并保留原始线段顺序，缓存随当前表格调用释放。"""
         super().__init__(rules)
-        self._oriented = {
-            orientation: tuple(rule for rule in rules if rule.orientation == orientation)
-            for orientation in ("horizontal", "vertical")
-        }
-        self._intervals: dict[tuple[str, tuple[float, ...], float], list[tuple[float, float]]] = {}
         self._coverages: dict[tuple[str, tuple[float, ...], float, float, float], float] = {}
+
+    def prime_coverages(self, queries: list[tuple[str, tuple[float, ...], float, float, float]]) -> None:
+        """一次预计算整张网格的覆盖查询，后续原判断代码直接读取缓存。"""
+        from ....._compute_backend import get_native
+
+        native = get_native()
+        queries = list(dict.fromkeys(queries))
+        queries = [q for q in queries if (q[0], q[1], q[4], q[2], q[3]) not in self._coverages]
+        if not queries:
+            return
+        result = native.coverage_batch(
+            [(int(rule.orientation == "vertical"), rule.coordinate, rule.start, rule.end) for rule in self],
+            [
+                (int(orientation == "vertical"), aliases, start, end, tolerance)
+                for orientation, aliases, start, end, tolerance in queries
+            ],
+        )
+        for (orientation, aliases, start, end, tolerance), value in zip(queries, result, strict=True):
+            self._coverages[(orientation, aliases, tolerance, start, end)] = value
 
     def coverage(self, orientation: str, aliases: tuple[float, ...], start: float, end: float, tolerance: float) -> float:
         """复用轨道匹配和相同查询，区间覆盖仍执行原有裁剪与浮点累加。"""
@@ -67,22 +81,8 @@ class _IndexedRules(list[_MergedRule]):
         cached = self._coverages.get(coverage_key)
         if cached is not None:
             return cached
-        intervals = self._intervals.get(key)
-        if intervals is None:
-            oriented = self._oriented.get(orientation, ())
-            if len(aliases) == 1:
-                coordinate = aliases[0]
-                intervals = [(rule.start, rule.end) for rule in oriented if abs(rule.coordinate - coordinate) <= tolerance]
-            else:
-                intervals = [
-                    (rule.start, rule.end)
-                    for rule in oriented
-                    if any(abs(rule.coordinate - alias) <= tolerance for alias in aliases)
-                ]
-            self._intervals[key] = intervals
-        result = covered_interval_ratio(intervals, start, end)
-        self._coverages[coverage_key] = result
-        return result
+        self.prime_coverages([(orientation, aliases, start, end, tolerance)])
+        return self._coverages[coverage_key]
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,28 +235,12 @@ class _SingleColumnEvidence:
 
 
 class _UnionFind:
-    """维护缺失内部隔断连接的原子网格并查集。"""
+    """保存原生网格连通计算的父节点传输状态。"""
 
     def __init__(self, size: int) -> None:
         """为固定数量原子格初始化各自独立的集合。"""
 
         self._parents = list(range(size))
-
-    def find(self, index: int) -> int:
-        """返回原子格根节点并执行路径压缩。"""
-
-        parent = self._parents[index]
-        if parent != index:
-            self._parents[index] = self.find(parent)
-        return self._parents[index]
-
-    def union(self, first: int, second: int) -> None:
-        """合并两个原子格所属集合。"""
-
-        first_root = self.find(first)
-        second_root = self.find(second)
-        if first_root != second_root:
-            self._parents[second_root] = first_root
 
 
 def _drawing_bbox_to_table_local(
@@ -372,33 +356,23 @@ def _merge_rule_fragments(
 ) -> list[_MergedRule]:
     """按方向和轴坐标吸附线段，再连接小间隙共线片段。"""
 
-    output: list[_MergedRule] = []
-    for orientation in ("horizontal", "vertical"):
-        oriented = [fragment for fragment in fragments if fragment.orientation == orientation]
-        coordinates = cluster_positions(
-            (fragment.coordinate for fragment in oriented),
-            snap_tolerance,
+    from ....._compute_backend import get_native
+
+    native = get_native()
+    coordinates = [
+        (
+            int(orientation == "vertical"),
+            cluster_positions((f.coordinate for f in fragments if f.orientation == orientation), snap_tolerance),
         )
-        for coordinate in coordinates:
-            intervals = sorted(
-                (
-                    min(fragment.start, fragment.end),
-                    max(fragment.start, fragment.end),
-                )
-                for fragment in oriented
-                if abs(fragment.coordinate - coordinate) <= snap_tolerance
-            )
-            if not intervals:
-                continue
-            current_start, current_end = intervals[0]
-            for start, end in intervals[1:]:
-                if start <= current_end + join_gap:
-                    current_end = max(current_end, end)
-                    continue
-                output.append(_MergedRule(orientation, coordinate, current_start, current_end))
-                current_start, current_end = start, end
-            output.append(_MergedRule(orientation, coordinate, current_start, current_end))
-    return output
+        for orientation in ("horizontal", "vertical")
+    ]
+    result = native.merge_rules(
+        [(int(f.orientation == "vertical"), f.coordinate, f.start, f.end) for f in fragments],
+        coordinates,
+        snap_tolerance,
+        join_gap,
+    )
+    return [_MergedRule("vertical" if o else "horizontal", c, start, end) for o, c, start, end in result]
 
 
 def _repeated_long_rule_endpoints(
@@ -784,12 +758,7 @@ def _separator_coverage_for_track(
 
     if isinstance(rules, _IndexedRules):
         return rules.coverage(orientation, track.aliases, start, end, snap_tolerance)
-    intervals = [
-        (rule.start, rule.end)
-        for rule in rules
-        if rule.orientation == orientation and any(abs(rule.coordinate - alias) <= snap_tolerance for alias in track.aliases)
-    ]
-    return covered_interval_ratio(intervals, start, end)
+    return _IndexedRules(rules).coverage(orientation, track.aliases, start, end, snap_tolerance)
 
 
 def _rect_lattice_is_repeated(
@@ -863,12 +832,7 @@ def _separator_coverage(
 
     if isinstance(rules, _IndexedRules):
         return rules.coverage(orientation, (coordinate,), start, end, snap_tolerance)
-    intervals = [
-        (rule.start, rule.end)
-        for rule in rules
-        if rule.orientation == orientation and abs(rule.coordinate - coordinate) <= snap_tolerance
-    ]
-    return covered_interval_ratio(intervals, start, end)
+    return _IndexedRules(rules).coverage(orientation, (coordinate,), start, end, snap_tolerance)
 
 
 def _grid_index(row: int, col: int, cols: int) -> int:
@@ -886,35 +850,16 @@ def _build_component_specs(
 ) -> tuple[GridCellSpec, ...] | None:
     """把原子格连通分量转成矩形逻辑单元格，非矩形分量整体拒绝。"""
 
-    components: dict[int, list[tuple[int, int]]] = {}
-    for row in range(rows):
-        for col in range(cols):
-            root = union_find.find(_grid_index(row, col, cols))
-            components.setdefault(root, []).append((row, col))
-    specs: list[GridCellSpec] = []
-    for positions in components.values():
-        row_values = [item[0] for item in positions]
-        col_values = [item[1] for item in positions]
-        min_row, max_row = min(row_values), max(row_values)
-        min_col, max_col = min(col_values), max(col_values)
-        expected_size = (max_row - min_row + 1) * (max_col - min_col + 1)
-        if len(positions) != expected_size:
-            return None
-        specs.append(
-            GridCellSpec(
-                row=min_row,
-                col=min_col,
-                rowspan=max_row - min_row + 1,
-                colspan=max_col - min_col + 1,
-                bbox=(
-                    x_tracks[min_col],
-                    y_tracks[min_row],
-                    x_tracks[max_col + 1],
-                    y_tracks[max_row + 1],
-                ),
-            )
-        )
-    return tuple(sorted(specs, key=lambda item: (item.row, item.col)))
+    from ....._compute_backend import get_native
+
+    parents, components = get_native().component_specs(union_find._parents, rows, cols)
+    union_find._parents = parents
+    if components is None:
+        return None
+    return tuple(
+        GridCellSpec(r, c, rs, cs, (x_tracks[c], y_tracks[r], x_tracks[c + cs], y_tracks[r + rs]))
+        for r, c, rs, cs in components
+    )
 
 
 def _occupied_text_rows(
@@ -1159,6 +1104,10 @@ def _physical_row_dense_baseline_pairs(
     text: NativeTableText,
     x_tracks: list[float],
     y_tracks: list[float],
+    *,
+    rules: list[_MergedRule] | None = None,
+    canonical_x_tracks: list[_CanonicalTrack] | None = None,
+    snap_tolerance: float = 0.0,
 ) -> tuple[dict[str, object], ...]:
     """识别同一物理行带内占用集合相同的多条稠密文本基线。"""
 
@@ -1190,15 +1139,41 @@ def _physical_row_dense_baseline_pairs(
         )
 
     ambiguous_pairs: list[dict[str, object]] = []
+    text_rows_by_index = {row.row_index: row for row in text.rows}
+    # 首行两个答题列的双行列名不是漏行：后面至少三行仅有左侧行名，两列答案全空且列名不含数值。
+    blank_answer_header = (
+        cols == 3
+        and len(rows_by_band) >= 4
+        and len(rows_by_band[0]) == 2
+        and all(entry[1] == (1, 2) for entry in rows_by_band[0])
+        and sum(bool(entries) for band, entries in rows_by_band.items() if band) >= 3
+        and all(not entries or all(entry[1] == (0,) for entry in entries) for band, entries in rows_by_band.items() if band)
+        and all(
+            not any(char.isdigit() for token in text_rows_by_index[index].tokens for char in token.text)
+            for index, _cols in rows_by_band[0]
+        )
+    )
     for band, entries in rows_by_band.items():
-        nonempty_entries = [entry for entry in entries if entry[1]]
-        if (
-            len(nonempty_entries) < 2
-            or len(nonempty_entries[0][1]) < dense_column_count
-            or any(entry[1] != nonempty_entries[0][1] for entry in nonempty_entries[1:])
-        ):
+        if band == 0 and blank_answer_header:
             continue
-        for previous, current in zip(nonempty_entries, nonempty_entries[1:]):
+        # 单列说明或错开基线的日期续行不能否定同一行带内重复出现的稠密数据记录。
+        dense_entries = [entry for entry in entries if len(entry[1]) >= dense_column_count]
+        # 日期主行也可能达到最低密度；只比较最大列占用的完整锚点，不把部分续行当成反证。
+        maximum_occupied = max((len(entry[1]) for entry in dense_entries), default=0)
+        dense_entries = [entry for entry in dense_entries if len(entry[1]) == maximum_occupied]
+        if len(dense_entries) < 2 or any(entry[1] != dense_entries[0][1] for entry in dense_entries[1:]):
+            continue
+        nonempty_entries = [entry for entry in entries if entry[1]]
+        original_dense_support = all(entry[1] == dense_entries[0][1] for entry in nonempty_entries)
+        if not original_dense_support and rules is not None and canonical_x_tracks is not None:
+            # 新增的续行忽略只处理整行被误合并的无列隔断带；真实列框里的多行单元格保持原判定。
+            if any(
+                _separator_coverage_for_track(rules, "vertical", track, y_tracks[band], y_tracks[band + 1], snap_tolerance)
+                >= SEPARATOR_COVERAGE_THRESHOLD
+                for track in canonical_x_tracks[1:-1]
+            ):
+                continue
+        for previous, current in zip(dense_entries, dense_entries[1:]):
             ambiguous_pairs.append(
                 {
                     "physical_row": band,
@@ -1207,6 +1182,25 @@ def _physical_row_dense_baseline_pairs(
                 }
             )
     return tuple(ambiguous_pairs)
+
+
+def _uncovered_dense_outer_rows(text: NativeTableText, x_tracks: list[float], y_tracks: list[float]) -> list[int]:
+    """检测物理网格首尾之外仍有完整多列记录，避免少量字框交叠伪装文字完整。"""
+    tolerance = max(0.5, 0.08 * text.median_glyph_height)
+    uncovered = []
+    for row in text.rows:
+        center_y = (row.bbox[1] + row.bbox[3]) / 2
+        if y_tracks[0] - tolerance <= center_y <= y_tracks[-1] + tolerance:
+            continue
+        occupied = {
+            col
+            for token in row.tokens
+            for col, (left, right) in enumerate(zip(x_tracks, x_tracks[1:]))
+            if left <= (token.bbox[0] + token.bbox[2]) / 2 <= right
+        }
+        if len(occupied) >= 2:
+            uncovered.append(row.row_index)
+    return uncovered
 
 
 def _looks_like_single_column_tracks(
@@ -1524,6 +1518,9 @@ def _build_vector_tracks(
             text,
             x_tracks,
             y_tracks,
+            rules=rules,
+            canonical_x_tracks=canonical_x_tracks,
+            snap_tolerance=snap_tolerance,
         )
         if is_line_grid
         else ()
@@ -1532,6 +1529,11 @@ def _build_vector_tracks(
         diagnostics["physical_row_dense_baseline_pairs"] = list(dense_baseline_pairs)
     if dense_baseline_pairs:
         return _reject_vector_candidate(diagnostics, "physical_row_undercount")
+    uncovered_rows = _uncovered_dense_outer_rows(text, x_tracks, y_tracks) if is_line_grid else []
+    if uncovered_rows:
+        if diagnostics is not None:
+            diagnostics["uncovered_dense_outer_rows"] = uncovered_rows
+        return _reject_vector_candidate(diagnostics, "physical_outer_row_undercount")
 
     return _VectorTracks(
         snap_tolerance=snap_tolerance,
@@ -1569,7 +1571,22 @@ def _build_vector_topology(
     rows = tracks.rows
     cols = tracks.cols
 
+    from ....._compute_backend import get_native
+
+    native = get_native()
+    if isinstance(rules, _IndexedRules):
+        queries = []
+        for row in range(rows):
+            for track in canonical_x_tracks[1:-1]:
+                for aliases in ((track.coordinate,), track.aliases):
+                    queries.append(("vertical", aliases, y_tracks[row], y_tracks[row + 1], snap_tolerance))
+        for track in canonical_y_tracks[1:-1]:
+            for col in range(cols):
+                for aliases in ((track.coordinate,), track.aliases):
+                    queries.append(("horizontal", aliases, x_tracks[col], x_tracks[col + 1], snap_tolerance))
+        rules.prime_coverages(queries)
     union_find = _UnionFind(rows * cols)
+    connections = []
     separator_decisions: list[float] = []
     ambiguous_separator_count = 0
     alias_separator_recoveries = 0
@@ -1603,9 +1620,11 @@ def _build_vector_topology(
                 alias_affected_rows.add(row)
             separator_decisions.append(max(coverage, 1.0 - coverage))
             if coverage <= 1.0 - SEPARATOR_COVERAGE_THRESHOLD:
-                union_find.union(
-                    _grid_index(row, boundary_index - 1, cols),
-                    _grid_index(row, boundary_index, cols),
+                connections.append(
+                    (
+                        _grid_index(row, boundary_index - 1, cols),
+                        _grid_index(row, boundary_index, cols),
+                    )
                 )
             elif coverage < SEPARATOR_COVERAGE_THRESHOLD:
                 ambiguous_separator_count += 1
@@ -1640,13 +1659,16 @@ def _build_vector_topology(
                     alias_affected_rows.add(boundary_index)
             separator_decisions.append(max(coverage, 1.0 - coverage))
             if coverage <= 1.0 - SEPARATOR_COVERAGE_THRESHOLD:
-                union_find.union(
-                    _grid_index(boundary_index - 1, col, cols),
-                    _grid_index(boundary_index, col, cols),
+                connections.append(
+                    (
+                        _grid_index(boundary_index - 1, col, cols),
+                        _grid_index(boundary_index, col, cols),
+                    )
                 )
             elif coverage < SEPARATOR_COVERAGE_THRESHOLD:
                 ambiguous_separator_count += 1
 
+    union_find._parents = native.grid_parents(rows * cols, connections)
     ambiguous_ratio = ambiguous_separator_count / len(separator_decisions) if separator_decisions else 0.0
     if diagnostics is not None:
         diagnostics["grid"] = {"rows": rows, "cols": cols}
@@ -1924,6 +1946,45 @@ def _build_vector_candidate(
     return _materialize_vector_candidate(tracks, topology, text, evidence_label, diagnostics)
 
 
+def _without_empty_edge_decorations(table_input: NativeTableInput, text: NativeTableText) -> NativeTableInput:
+    """删除近外框的短装饰竖线；须有空白外带或该伪轨道横切正文字形。"""
+
+    width, height = table_local_size(table_input.table_bbox, normalize_angle(table_input.angle))
+    tolerance = max(0.5, 0.08 * text.median_glyph_height)
+    local_rules = [
+        (rule, page_bbox_to_table_local(rule.bbox, table_input.table_bbox, normalize_angle(table_input.angle)))
+        for rule in table_input.drawing_lines
+    ]
+    vertical = [(rule, box) for rule, box in local_rules if box and box[3] - box[1] > box[2] - box[0]]
+    removed = set()
+    for rule, box in vertical:
+        coordinate = (box[0] + box[2]) / 2
+        distance = min(coordinate, width - coordinate)
+        if not tolerance < distance < min(0.05 * width, 2 * text.median_glyph_height):
+            continue
+        intervals = [(other[1], other[3]) for _, other in vertical if abs((other[0] + other[2]) / 2 - coordinate) <= tolerance]
+        if covered_interval_ratio(intervals, 0.0, height) >= 0.30:
+            continue
+        outside = (
+            [glyph for glyph in text.glyphs if (glyph.bbox[0] + glyph.bbox[2]) / 2 < coordinate]
+            if coordinate < width / 2
+            else [glyph for glyph in text.glyphs if (glyph.bbox[0] + glyph.bbox[2]) / 2 > coordinate]
+        )
+        # 短线所在高度之外横切完整字形，说明它不能延伸为全表列界。
+        cuts_body = any(
+            glyph.bbox[0] + tolerance < coordinate < glyph.bbox[2] - tolerance
+            and all(glyph.bbox[3] < start - tolerance or glyph.bbox[1] > end + tolerance for start, end in intervals)
+            for glyph in text.glyphs
+        )
+        if not outside or cuts_body:
+            removed.add(rule)
+    return (
+        replace(table_input, drawing_lines=tuple(rule for rule in table_input.drawing_lines if rule not in removed))
+        if removed
+        else table_input
+    )
+
+
 def build_vector_candidates(
     table_input: NativeTableInput,
     text: NativeTableText,
@@ -1933,9 +1994,10 @@ def build_vector_candidates(
 
     candidates: list[NativeTableCandidate] = []
     rule_cache: dict[tuple[bool, bool, float], _RulePreparation] = {}
+    line_input = _without_empty_edge_decorations(table_input, text)
     raw_line_diagnostics: dict[str, Any] | None = {} if diagnostics is not None else None
     line_candidate = _build_vector_candidate(
-        table_input,
+        line_input,
         text,
         include_drawing=True,
         include_rectangles=False,
@@ -1945,10 +2007,12 @@ def build_vector_candidates(
     )
     line_hypotheses = [raw_line_diagnostics] if raw_line_diagnostics is not None else []
     selected_line_diagnostics = raw_line_diagnostics
-    if line_candidate is None and len(line_hypotheses) < MAX_TRACK_HYPOTHESES:
+    # 高分也可能由大量真实格稀释装饰线歧义；非零歧义仍须验证支持轨道。
+    ambiguous = line_candidate is not None and "ambiguous_separator_ratio=0.0000" not in line_candidate.issues
+    if (line_candidate is None or line_candidate.score < 0.95 or ambiguous) and len(line_hypotheses) < MAX_TRACK_HYPOTHESES:
         supported_line_diagnostics: dict[str, Any] | None = {} if diagnostics is not None else None
         supported_line_candidate = _build_vector_candidate(
-            table_input,
+            line_input,
             text,
             include_drawing=True,
             include_rectangles=False,
@@ -1965,7 +2029,7 @@ def build_vector_candidates(
             if removed_tracks:
                 line_hypotheses.append(supported_line_diagnostics)
                 selected_line_diagnostics = supported_line_diagnostics
-        if supported_line_candidate is not None:
+        if supported_line_candidate is not None and (line_candidate is None or supported_line_candidate.score >= 0.95):
             line_candidate = supported_line_candidate
             selected_line_diagnostics = supported_line_diagnostics
     if diagnostics is not None and selected_line_diagnostics is not None:

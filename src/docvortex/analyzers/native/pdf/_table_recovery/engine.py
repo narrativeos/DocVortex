@@ -7,7 +7,12 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from loguru import logger
+
 from .candidate import serialize_candidate_html
+from .banded_numeric import build_banded_numeric_candidate
+from .banded_rowspan import build_banded_rowspan_candidate
+from .aligned_numeric import build_aligned_numeric_candidate, regroup_numeric_text
 from .contracts import (
     NativeTableCandidate,
     NativeTableInput,
@@ -17,10 +22,12 @@ from .contracts import (
     NativeTableText,
 )
 from .geometry import bbox_intersection, normalize_bbox
+from .hierarchical import build_hierarchical_candidate, find_nested_table_evidence, preserves_nested_cells
 from .sparse_hybrid import build_sparse_hybrid_candidates, diagnose_sparse_hybrid_candidate_builds
 from .sparse_multiline import build_sparse_multiline_candidates, diagnose_sparse_multiline_candidate_builds
 from .rule_band import build_rule_band_candidates
 from .text import build_native_table_text
+from .text_quality import TableTextQuality, measure_table_input_quality, measure_table_text_quality
 from .text_grid import build_text_candidates, diagnose_text_candidate_builds
 from .vector import MAX_PRIMITIVES_PER_TABLE, build_vector_candidates, diagnose_vector_candidate_builds
 
@@ -54,6 +61,7 @@ class _CandidateEvaluation:
     selected: NativeTableCandidate | None
     physical_topology_conflict: bool
     first_rejection_gate: str | None
+    text_quality: tuple[TableTextQuality, ...] = ()
 
 
 def _is_verified_line_candidate(candidate: NativeTableCandidate) -> bool:
@@ -260,6 +268,31 @@ def _has_physical_row_undercount(
     return False
 
 
+def _minimum_columns_after_row_undercount(
+    vector_attempts: tuple[dict[str, Any], ...],
+) -> int:
+    """仅用最终规范化线网格的漏行拒绝保留列数下界，不采信已撤销的轨道假设。"""
+
+    minimum_columns = 0
+    for attempt in vector_attempts:
+        if attempt.get("evidence") != "line_grid" or attempt.get("first_rejection_gate") != "physical_row_undercount":
+            continue
+        grid = attempt.get("grid")
+        tracks = attempt.get("canonical_tracks")
+        if isinstance(grid, dict) and isinstance(tracks, list) and len(tracks) == grid.get("cols", 0) + 1:
+            minimum_columns = max(minimum_columns, grid["cols"])
+    return minimum_columns
+
+
+def _retain_column_consistent_candidates(
+    candidates: list[NativeTableCandidate],
+    minimum_columns: int,
+) -> list[NativeTableCandidate]:
+    """排除丢失已验证叶子列的后备结构，避免完整捕获文本掩盖跨列误并。"""
+
+    return [candidate for candidate in candidates if candidate.cols >= minimum_columns]
+
+
 def _table_primitive_count(table_input: NativeTableInput) -> int:
     """统计实际与目标表格相交的 drawing 和矩形数量。"""
 
@@ -339,6 +372,9 @@ def _evaluate_native_pdf_table(
             False,
             "primitive_limit",
         )
+    input_quality = measure_table_input_quality(table_input)
+    if input_quality.rejected:
+        return _CandidateEvaluation(primitive_count, None, (), (), None, False, "text_quality", (input_quality,))
     text = build_native_table_text(table_input)
     if text is None:
         return _CandidateEvaluation(
@@ -351,12 +387,30 @@ def _evaluate_native_pdf_table(
             "native_text",
         )
     vector_attempt_records: list[dict[str, Any]] = []
+    nested_evidence = find_nested_table_evidence(table_input, text)
+    hierarchical_candidate = build_hierarchical_candidate(table_input, text, nested_evidence)
     vector_candidates = build_vector_candidates(
         table_input,
         text,
         diagnostics=vector_attempt_records,
     )
     vector_attempts: tuple[dict[str, Any], ...] = tuple(vector_attempt_records)
+    minimum_columns = _minimum_columns_after_row_undercount(vector_attempts)
+    vector_candidates = _retain_column_consistent_candidates(vector_candidates, minimum_columns)
+    aligned_text = regroup_numeric_text(text)
+    aligned_candidate = build_aligned_numeric_candidate(table_input, aligned_text)
+    if aligned_candidate is not None and not preserves_nested_cells(aligned_candidate, nested_evidence):
+        aligned_candidate = None
+    if aligned_candidate is not None and aligned_candidate.cols < minimum_columns:
+        aligned_candidate = None
+    aligned_replaces_vector = aligned_candidate is not None and any(
+        aligned_candidate.rows >= 1.5 * c.rows or aligned_candidate.cols > c.cols for c in vector_candidates
+    )
+    if aligned_candidate is not None:
+        # 多条原生数值行证明旧矢量格发生欠分割时，先撤销错误快速接受，再运行完整恢复。
+        vector_candidates = [
+            c for c in vector_candidates if not (aligned_candidate.rows >= 1.5 * c.rows or aligned_candidate.cols > c.cols)
+        ]
     physical_topology_conflict = False
     if any(_is_verified_rect_candidate(candidate) for candidate in vector_candidates):
         physical_topology_conflict = _has_attempted_line_rect_grid_conflict(vector_attempts)
@@ -370,7 +424,13 @@ def _evaluate_native_pdf_table(
             is not None
         ):
             physical_topology_conflict = False
-    vector_selection = None if physical_topology_conflict else _select_candidate(vector_candidates)
+    vector_selection = (
+        None
+        if physical_topology_conflict
+        else _select_candidate(
+            [candidate for candidate in vector_candidates if preserves_nested_cells(candidate, nested_evidence)]
+        )
+    )
     sparse_hybrid_allowed = len(text.rows) >= 2 and vector_selection is None and not physical_topology_conflict
     if sparse_hybrid_allowed:
         if not vector_attempts:
@@ -382,9 +442,13 @@ def _evaluate_native_pdf_table(
             sparse_hybrid_allowed = False
     rule_band_candidates = build_rule_band_candidates(table_input, text) if sparse_hybrid_allowed else []
     sparse_hybrid_candidates = (
-        build_sparse_hybrid_candidates(table_input, text) if sparse_hybrid_allowed and not rule_band_candidates else []
+        build_sparse_hybrid_candidates(table_input, text)
+        if sparse_hybrid_allowed and not _retain_column_consistent_candidates(rule_band_candidates, minimum_columns)
+        else []
     )
-    sparse_hybrid_selection = _select_candidate([*rule_band_candidates, *sparse_hybrid_candidates])
+    sparse_hybrid_selection = _select_candidate(
+        _retain_column_consistent_candidates([*rule_band_candidates, *sparse_hybrid_candidates], minimum_columns)
+    )
     text_candidates = (
         build_text_candidates(table_input, text)
         if len(text.rows) >= 2 and vector_selection is None and sparse_hybrid_selection is None
@@ -400,11 +464,15 @@ def _evaluate_native_pdf_table(
             text_candidates = []
     existing_generated_candidates = [
         *vector_candidates,
+        *([hierarchical_candidate] if hierarchical_candidate is not None else []),
         *rule_band_candidates,
         *sparse_hybrid_candidates,
         *text_candidates,
     ]
-    existing_candidates = _remove_undercounted_vector_candidates(existing_generated_candidates)
+    existing_candidates = _retain_column_consistent_candidates(
+        _remove_undercounted_vector_candidates(existing_generated_candidates), minimum_columns
+    )
+    existing_candidates = [candidate for candidate in existing_candidates if preserves_nested_cells(candidate, nested_evidence)]
     existing_verified = any(_passes_verified_threshold(candidate) for candidate in existing_candidates)
     sparse_multiline_allowed = len(text.rows) >= 2 and not physical_topology_conflict and not existing_verified
     if sparse_multiline_allowed:
@@ -416,22 +484,99 @@ def _evaluate_native_pdf_table(
         if _has_alias_affected_physical_blank_row(vector_attempts):
             sparse_multiline_allowed = False
     sparse_multiline_candidates = build_sparse_multiline_candidates(table_input, text) if sparse_multiline_allowed else []
+    banded_candidate = (
+        build_banded_numeric_candidate(table_input, text, {})
+        if sparse_multiline_allowed and not _retain_column_consistent_candidates(sparse_multiline_candidates, minimum_columns)
+        else None
+    )
     generated_candidates = [
         *existing_generated_candidates,
         *sparse_multiline_candidates,
+        *([banded_candidate] if banded_candidate is not None else []),
     ]
-    candidates = _remove_undercounted_vector_candidates(generated_candidates)
+    candidates = _retain_column_consistent_candidates(
+        _remove_undercounted_vector_candidates(generated_candidates), minimum_columns
+    )
+    candidates = [candidate for candidate in candidates if preserves_nested_cells(candidate, nested_evidence)]
     selected = None if physical_topology_conflict else _select_candidate(candidates)
+    header_undercount = (
+        selected is not None
+        and aligned_candidate is not None
+        and any(
+            cell.colspan >= 3
+            and sum(
+                bool(new.content)
+                and cell.bbox[0] <= new.bbox[0]
+                and new.bbox[2] <= cell.bbox[2]
+                and new.bbox[1] < cell.bbox[3]
+                and cell.bbox[1] < new.bbox[3]
+                for new in aligned_candidate.cells
+            )
+            >= 2
+            for cell in selected.cells[: selected.cols * 2]
+        )
+    )
+    if selected is not None and aligned_candidate is not None and not header_undercount:
+        # 相同组标题的文字及列轨证明跨列，旧候选单格放置会错误地只标注一个年份。
+        header_undercount = any(
+            new.row < 2
+            and new.colspan >= 2
+            and new.content.strip()
+            and any(old.row < 2 and old.colspan == 1 and old.content == new.content for old in selected.cells)
+            for new in aligned_candidate.cells
+        )
+    if (
+        aligned_candidate is not None
+        and not physical_topology_conflict
+        and (
+            aligned_replaces_vector
+            or not existing_candidates
+            or header_undercount
+            or selected is not None
+            and (aligned_candidate.rows >= 1.5 * selected.rows or aligned_candidate.cols > selected.cols)
+        )
+    ):
+        # 完整原生数值列和文字净空同时通过的网格，比只按缺失横线推导的行数更可信。
+        selected = aligned_candidate
+    if selected is aligned_candidate and selected is not None:
+        text = aligned_text
+        generated_candidates.append(aligned_candidate)
+        candidates.append(aligned_candidate)
+    rowspan_candidate = build_banded_rowspan_candidate(table_input, text, aligned_text) if sparse_hybrid_allowed else None
+    if (
+        rowspan_candidate is not None
+        and rowspan_candidate.cols >= minimum_columns
+        and preserves_nested_cells(rowspan_candidate, nested_evidence)
+    ):
+        generated_candidates.append(rowspan_candidate)
+        candidates.append(rowspan_candidate)
+        if selected is None or (selected.cols == rowspan_candidate.cols and selected.rows < rowspan_candidate.rows):
+            # 重复横线带内的独立数值行证明旧视觉行桥接；仅首列有跨行证据。
+            selected = rowspan_candidate
+            text = aligned_text
     if selected is not None:
         first_rejection_gate = None
     elif not generated_candidates:
         first_rejection_gate = "candidate_generation"
     elif not candidates:
-        first_rejection_gate = "undercount_guard"
+        first_rejection_gate = (
+            "nested_cell_undercount"
+            if nested_evidence
+            else "physical_column_undercount"
+            if minimum_columns and any(candidate.cols < minimum_columns for candidate in generated_candidates)
+            else "undercount_guard"
+        )
     elif not any(_passes_verified_threshold(candidate) for candidate in candidates):
         first_rejection_gate = "verified_threshold"
     else:
         first_rejection_gate = "topology_conflict"
+    text_quality = (input_quality,)
+    if selected is not None:
+        output_quality = measure_table_text_quality((cell.content for cell in selected.cells), stage="output")
+        text_quality += (output_quality,)
+        if output_quality.rejected:
+            selected = None
+            first_rejection_gate = "text_quality"
     return _CandidateEvaluation(
         primitive_count,
         text,
@@ -440,6 +585,7 @@ def _evaluate_native_pdf_table(
         selected,
         physical_topology_conflict,
         first_rejection_gate,
+        text_quality,
     )
 
 
@@ -471,6 +617,10 @@ def diagnose_native_pdf_table(table_input: NativeTableInput) -> dict[str, Any]:
         if evaluation.text is not None
         else ()
     )
+    if evaluation.text is not None and len(evaluation.text.rows) >= 4:
+        banded_diagnostics: dict[str, Any] = {}
+        build_banded_numeric_candidate(table_input, evaluation.text, banded_diagnostics)
+        sparse_hybrid_attempts = (*sparse_hybrid_attempts, banded_diagnostics)
     rule_band_attempts: list[dict[str, Any]] = []
     if evaluation.text is not None:
         build_rule_band_candidates(table_input, evaluation.text, diagnostics=rule_band_attempts)
@@ -563,6 +713,7 @@ def diagnose_native_pdf_table(table_input: NativeTableInput) -> dict[str, Any]:
         "glyph_count": len(evaluation.text.glyphs) if evaluation.text else 0,
         "visual_text_rows": len(evaluation.text.rows) if evaluation.text else 0,
         "first_rejection_gate": first_rejection_gate,
+        "text_quality": [quality.diagnostic() for quality in evaluation.text_quality],
         "line_rect_topology_conflict": (
             evaluation.physical_topology_conflict or _has_line_rect_topology_conflict(evaluation.candidates)
         ),
@@ -585,6 +736,13 @@ def recover_native_pdf_table(
     evaluation = _evaluate_native_pdf_table(table_input)
     selected = evaluation.selected
     if selected is None or evaluation.text is None:
+        for quality in evaluation.text_quality:
+            if quality.rejected:
+                logger.bind(table_text_quality=quality.diagnostic()).debug(
+                    "Native table rejected: reason=text_quality, "
+                    f"stage={quality.stage}, text_chars={quality.text_chars}, "
+                    f"abnormal_chars={quality.abnormal_chars}, abnormal_ratio={quality.abnormal_ratio:.4f}"
+                )
         return None
     diagnostics = tuple(
         [

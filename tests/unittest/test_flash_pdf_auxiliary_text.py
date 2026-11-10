@@ -11,6 +11,30 @@ from _flash_pdf_test_utils import (
 from docvortex.analyzers.native.pdf import auxiliary_text, models, pipeline, text_blocks
 
 
+def test_prepared_table_lines_reuse_by_angle_and_input_identity(monkeypatch) -> None:
+    """同页同方向只转换一次轴线，更换方向或线集合时重新计算。"""
+
+    page = _prepared_text_page(page_size=(1000.0, 1000.0))
+    page.drawing_lines = [models._AxisLine(bbox=(10.0, 20.0, 90.0, 21.0), width=1.0, orientation="horizontal")]
+    page.table_bboxes = [(5.0, 15.0, 95.0, 25.0)]
+    original = auxiliary_text._transform_axis_lines
+    calls = []
+
+    def counting(drawing_lines, page_size, angle):
+        """记录真实轴线变换次数，同时保留变换结果。"""
+        calls.append(angle)
+        return original(drawing_lines, page_size, angle)
+
+    monkeypatch.setattr(auxiliary_text, "_transform_axis_lines", counting)
+    first = auxiliary_text._prepared_local_axis_table_lines(page, 0)
+    assert auxiliary_text._prepared_local_axis_table_lines(page, 0) is first
+    assert len(first[1]) == 1
+    auxiliary_text._prepared_local_axis_table_lines(page, 90)
+    page.drawing_lines = list(page.drawing_lines)
+    auxiliary_text._prepared_local_axis_table_lines(page, 0)
+    assert calls == [0, 90, 0]
+
+
 def test_page_footnote_uses_separator_and_stops_before_distant_footer_text() -> None:
     """验证单栏页脚注由页底横线触发，并在较大行间隙前停止扩展。"""
 
@@ -1840,3 +1864,35 @@ def test_distant_same_row_text_inherits_top_page_number_header_type() -> None:
 
     assert page_number.semantic_type == "page_number"
     assert running_title.semantic_type == "header"
+
+
+def test_near_page_sized_image_overlapping_page_number_stays_image() -> None:
+    """验证与底部页码行轻微重叠的近整页大图不会被改判成页脚。"""
+
+    page = _prepared_text_page(
+        _text_line(
+            "3",
+            (90.0, 82.0, 95.0, 87.0),
+            0,
+            semantic_type="page_number",
+        ),
+        page_size=(100.0, 100.0),
+    )
+    full_page_image = {
+        "type": "image",
+        "bbox": (10.0, 8.0, 90.0, 85.0),
+        "angle": 0,
+        "content": "",
+    }
+    marginal_banner = {
+        "type": "image",
+        "bbox": (7.0, 92.0, 39.0, 97.0),
+        "angle": 0,
+        "content": "",
+    }
+    page.fixed_blocks = [full_page_image, marginal_banner]
+
+    auxiliary_text._classify_page_number_outer_companions([page])
+
+    assert full_page_image["type"] == "image"
+    assert marginal_banner["type"] == "footer"

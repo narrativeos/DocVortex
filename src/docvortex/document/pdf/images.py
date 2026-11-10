@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import gc
 import math
 import multiprocessing
 import os
@@ -40,6 +41,14 @@ def _positive_int_env(name: str, default: int) -> int:
     except ValueError:
         return default
     return value if value > 0 else default
+
+
+def get_pdf_render_backend() -> str:
+    """默认 auto 解析为 session；会话按计算后端优先使用 Rust，错误不触发旧渲染重试。"""
+    backend = os.environ.get("DOCVORTEX_PDF_RENDER_BACKEND", "auto").strip().lower()
+    if backend not in {"auto", "legacy", "session"}:
+        raise ValueError("DOCVORTEX_PDF_RENDER_BACKEND must be auto, legacy or session")
+    return "session" if backend == "auto" else backend
 
 
 def get_load_images_timeout() -> int:
@@ -126,6 +135,46 @@ def _close_image_dicts(images_list: list[dict[str, Any]] | None) -> None:
             pil_img.close()
         except Exception:
             pass
+
+
+def _load_visual_crops_worker(pdf_bytes, dpi, start_page_id, end_page_id, prepared_pages):
+    """在渲染进程内裁剪并编码视觉素材，只向父进程传递原块索引和 JPEG。"""
+    from .visuals import _attach_prepared_visual_block_images
+
+    images = None
+    try:
+        images = load_images_from_pdf_core(pdf_bytes, dpi, start_page_id, end_page_id, ImageType.PIL)
+        _attach_prepared_visual_block_images(prepared_pages, images, start_page_id)
+        return [[(index, block.get("image_base64")) for index, block in page] for page in prepared_pages]
+    finally:
+        _close_image_dicts(images)
+        # PDFium 句柄已关闭，但 PdfDocument/PdfPage 的近期循环引用仍可持有整份
+        # PDF 输入。每个 worker 任务回收年轻代，避免依赖自动 GC 时机累积大载荷。
+        gc.collect(0)
+
+
+def _load_visual_crops_from_pdf_bytes_range(
+    pdf_bytes, prepared_pages, start_page_id, end_page_id, timeout, threads, *, session=None
+):
+    """沿原进程池、窗口预算和超时路径获取已编码素材，不更改公共页图接口。"""
+    if session is not None:
+        session.validate_input(pdf_bytes)
+        return session.render(start_page_id, end_page_id, timeout=timeout, prepared_crops=prepared_pages)
+    if get_pdf_render_backend() == "session":
+        from .render_session import PDFRenderSession
+
+        with PDFRenderSession(pdf_bytes, threads=threads, timeout=timeout) as owned_session:
+            return owned_session.render(start_page_id, end_page_id, prepared_crops=prepared_pages)
+    return _load_pdf_render_tasks(
+        pdf_bytes,
+        DEFAULT_PDF_IMAGE_DPI,
+        start_page_id,
+        end_page_id,
+        ImageType.PIL,
+        timeout,
+        threads,
+        prepared_pages,
+    )
 
 
 def _calculate_render_process_count(total_pages: int, threads: int, cpu_count: int | None = None) -> int:
@@ -333,6 +382,9 @@ def _get_pdf_render_executor() -> ProcessPoolExecutor:
     """惰性创建并复用持久 PDF 渲染进程池。"""
     global _pdf_render_atexit_registered, _pdf_render_executor
 
+    from .render_session import prepare_legacy_render_pool
+
+    prepare_legacy_render_pool()
     with _pdf_render_executor_lock:
         if _pdf_render_executor is None:
             if not _pdf_render_atexit_registered:
@@ -393,8 +445,35 @@ def load_images_from_pdf_bytes_range(
     image_type: Literal["pil_img", "base64_img"] = ImageType.PIL,
     timeout: int | None = None,
     threads: int | None = None,
+    *,
+    session=None,
 ) -> list[dict[str, Any]]:
-    """在持久进程池中批量渲染指定闭区间页面。"""
+    """批量渲染指定闭区间页面，可显式复用文档级渲染会话。"""
+    if session is not None:
+        session.validate_input(pdf_bytes)
+        return session.render(start_page_id, end_page_id, dpi=dpi, image_type=image_type, timeout=timeout)
+    if get_pdf_render_backend() == "session":
+        from .render_session import PDFRenderSession
+
+        with PDFRenderSession(pdf_bytes, threads=threads, timeout=timeout) as owned_session:
+            return owned_session.render(start_page_id, end_page_id, dpi=dpi, image_type=image_type)
+    return _load_pdf_render_tasks(pdf_bytes, dpi, start_page_id, end_page_id, image_type, timeout, threads)
+
+
+def _load_pdf_render_tasks(pdf_bytes, dpi, start_page_id, end_page_id, image_type, timeout, threads, prepared_crops=None):
+    """将旧池的整个任务窗口登记到共享并发预算。"""
+    from .render_session import legacy_render_scope
+
+    if end_page_id < start_page_id:
+        return []
+    with legacy_render_scope():
+        return _load_pdf_render_tasks_core(
+            pdf_bytes, dpi, start_page_id, end_page_id, image_type, timeout, threads, prepared_crops
+        )
+
+
+def _load_pdf_render_tasks_core(pdf_bytes, dpi, start_page_id, end_page_id, image_type, timeout, threads, prepared_crops=None):
+    """共享任务提交、结果顺序和异常回收，裁图任务使用相同的进程数与超时规则。"""
     if end_page_id < start_page_id:
         return []
 
@@ -429,14 +508,20 @@ def load_images_from_pdf_bytes_range(
                 f"Submitting PDF render task: parent_pid={parent_pid}, thread={parent_thread}, "
                 f"executor={executor_id}, pages={page_range}"
             )
+            if prepared_crops is None:
+                worker = _load_images_from_pdf_worker
+                last_argument = image_type
+            else:
+                worker = _load_visual_crops_worker
+                last_argument = prepared_crops[range_start - start_page_id : range_end - start_page_id + 1]
             future = _submit_pdf_render_task(
                 executor,
-                _load_images_from_pdf_worker,
+                worker,
                 pdf_bytes,
                 dpi,
                 range_start,
                 range_end,
-                image_type,
+                last_argument,
             )
             futures.append(future)
             future_to_range[future] = (range_start, range_end)
@@ -480,8 +565,9 @@ def load_images_from_pdf_bytes_range(
         recycle_executor = True
         raise
     except Exception:
-        for images_list in collected_image_lists:
-            _close_image_dicts(images_list)
+        if prepared_crops is None:
+            for images_list in collected_image_lists:
+                _close_image_dicts(images_list)
         raise
     finally:
         if recycle_executor:
@@ -646,6 +732,7 @@ __all__ = [
     "ImageType",
     "crop_img",
     "get_crop_img",
+    "get_pdf_render_backend",
     "get_crop_np_img",
     "load_images_from_pdf_bytes_range",
     "load_images_from_pdf_core",

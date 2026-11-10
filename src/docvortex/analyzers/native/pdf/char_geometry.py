@@ -5,23 +5,23 @@ from __future__ import annotations
 import math
 import re
 import statistics
+import sys
 import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Literal, Sequence, TypeAlias
+from typing import Any, Literal, TypeAlias
+
 
 from ....document.pdf._document import PDFPageTextGeometry
 from ....schema import BBox
 from .geometry import (
-    _bbox_axis_overlap_ratio,
     _bbox_union_many,
     _clip_bbox,
     _clip_validated_bbox,
     _coerce_bbox,
     _rotate_bbox_from_upright,
     _rotate_bbox_to_upright,
-    _rotate_origin_to_upright,
 )
 from .models import _LineItem
 
@@ -102,6 +102,8 @@ class DocumentGeometryPlan:
     char_repairs: dict[CharKey, CharLayoutGeometry] = field(default_factory=dict)
     line_repairs: dict[LineKey, LineGeometryRepair] = field(default_factory=dict)
     line_style_scales: dict[LineKey, float] = field(default_factory=dict)
+    # 单页极端字体矩阵异常有重复字形和健康同族行证明，允许在容器认领前校正。
+    local_metric_repair_sources: set[LineKey] = field(default_factory=set)
     line_ink_bboxes: dict[LineKey, BBox] = field(default_factory=dict)
     line_baselines: dict[LineKey, float] = field(default_factory=dict)
     style_inflated_runs: set[RunKey] = field(default_factory=set)
@@ -334,10 +336,8 @@ def _script_group(text: str) -> str:
     return "other"
 
 
-def _font_run_key(char: dict[str, Any], angle: int, text: str) -> tuple[RunKey, float]:
-    """构造字体族、字号、字重、方向和文字类别组成的 run key。"""
-
-    font = char.get("font") or {}
+def _font_run_metadata(font):
+    """按既有顺序转换字体字段，特殊 Python 值保留原异常行为。"""
     font_name = str(font.get("name") or "<unknown>")
     try:
         font_size = float(font.get("size") or 0.0)
@@ -351,6 +351,64 @@ def _font_run_key(char: dict[str, Any], angle: int, text: str) -> tuple[RunKey, 
         weight = int(round(float(font.get("weight") or 0.0) / 100.0) * 100)
     except (TypeError, ValueError):
         weight = 0
+    return font_name, font_size, flags, weight
+
+
+class _NativeFontUnsupported(Exception):
+    """表示字体含自定义转换，原生文档必须在转换之前选择参考路径。"""
+
+
+class _ReadOnlyFontCache:
+    """Rust 几何已准备完成后的单行只读字体缓存，不跨行保留可变字典。"""
+
+    def __init__(self, *, native_only=False):
+        """每行建立有界身份表；原生文档只在首次见到字体时校验转换类型。"""
+        self.values = {}
+        self.native_only = native_only
+
+    def metadata(self, font):
+        """普通字体首见时校验字段，特殊转换前清空身份表以保留回调行为。"""
+        cached = self.values.get(id(font))
+        if cached is not None and cached[0] is font:
+            return cached[1]
+        if type(font) is not dict or any(
+            type(font.get(name)) not in (str, int, float, bool, type(None)) for name in ("name", "size", "flags", "weight")
+        ):
+            self.values.clear()
+            if self.native_only:
+                raise _NativeFontUnsupported
+            return _font_run_metadata(font)
+        result = _font_run_metadata(font)
+        if len(self.values) >= 4096:
+            self.values.pop(next(iter(self.values)))
+        self.values[id(font)] = (font, result)
+        return result
+
+
+def _font_run_key(char: dict[str, Any], angle: int, text: str, metadata_cache=None) -> tuple[RunKey, float]:
+    """构造 run key；调用内缓存以字段值作键，字体发生变化时不会复用旧元数据。"""
+    font = char.get("font")
+    if type(metadata_cache) is _ReadOnlyFontCache and (type(char) is not dict or type(font) not in (dict, type(None))):
+        metadata_cache.values.clear()
+    font = font or {}
+    if type(metadata_cache) is _ReadOnlyFontCache:
+        if type(char) is not dict:
+            metadata_cache.values.clear()
+        font_name, font_size, flags, weight = metadata_cache.metadata(font)
+        return _cached_run_key(font_name, font_size, flags, weight, angle, _script_group(text)), font_size
+    key = None
+    if metadata_cache is not None and type(font) is dict:
+        values = tuple(font.get(name) for name in ("name", "size", "flags", "weight"))
+        if type(values[0]) in (str, type(None)) and all(
+            type(value) in (str, int, float, bool, type(None)) for value in values[1:]
+        ):
+            key = values
+    metadata = metadata_cache.get(key) if key is not None else None
+    if metadata is None:
+        metadata = _font_run_metadata(font)
+        if key is not None:
+            metadata_cache[key] = metadata
+    font_name, font_size, flags, weight = metadata
     return _cached_run_key(
         font_name,
         font_size,
@@ -419,164 +477,221 @@ def _source_bbox(
     return side_bbox
 
 
-def _style_line_is_inflated(
-    source_height: float,
-    font_sizes: Sequence[float],
-    tight_heights: Sequence[float],
-) -> bool:
-    """按统一阈值判断一行 loose 高度是否显著偏离字号与 tight 字形。"""
+def _plain_source_records(line, geometry, anchors_only):
+    """普通行只按源顺序打包一次，坐标验证交给 Rust，特殊读取保留旧路径。"""
+    from ._native_geometry import raw_bbox
 
-    if not tight_heights:
-        return False
-    style_scale = max(
-        statistics.median(font_sizes) if font_sizes else 0.0,
-        _quantile(tight_heights, 0.75),
-    )
-    if style_scale < STYLE_INFLATION_MIN_SCALE:
-        return False
-    tight_height = max(0.1, _quantile(tight_heights, 0.75))
-    return (
-        source_height > STYLE_INFLATION_LOOSE_FONT_RATIO * style_scale
-        and source_height > STYLE_INFLATION_LOOSE_TIGHT_RATIO * tight_height
-    )
-
-
-def _document_requires_full_geometry(
-    lines_by_page: list[list[_LineItem]],
-    geometries: list[PDFPageTextGeometry],
-    page_sizes: list[tuple[float, float]],
-) -> _DocumentGeometryRisk:
-    """流式识别布局与样式风险，避免健康文档保留整本字符样本。"""
-
-    x_ratios: dict[RunKey, list[float]] = defaultdict(list)
-    x_overlaps: dict[RunKey, int] = defaultdict(int)
-    y_ratios: list[float] = []
-    y_extreme_runs: Counter[RunKey] = Counter()
-    style_line_counts: Counter[RunKey] = Counter()
-    style_inflated_lines: dict[RunKey, set[LineKey]] = defaultdict(set)
-    for page_index, (lines, geometry, page_size) in enumerate(
-        zip(lines_by_page, geometries, page_sizes, strict=True),
+    if (
+        type(line) is not _LineItem
+        or type(geometry) is not PDFPageTextGeometry
+        or type(line.chars) is not list
+        or any(type(values) is not dict for values in (geometry.tight_bboxes, geometry.loose_bboxes, geometry.origins))
     ):
-        for line in lines:
-            entries: list[tuple[int, str, BBox, BBox, tuple[float, float], RunKey, float]] = []
-            for position, char in enumerate(line.chars):
-                text = str(char.get("char") or "")
-                char_idx = char.get("char_idx")
-                if not _is_anchor_text(text) or isinstance(char_idx, bool) or not isinstance(char_idx, int):
-                    continue
-                source = _clip_validated_bbox(_source_bbox(char, geometry, char_idx), page_size)
-                tight = _clip_validated_bbox(_coerce_bbox(geometry.tight_bboxes.get(char_idx)), page_size)
-                origin = _coerce_origin(geometry.origins.get(char_idx))
-                if source is None or tight is None or origin is None:
-                    continue
-                run_key, font_size = _font_run_key(char, line.angle, text)
-                entries.append(
-                    (
-                        position,
-                        text,
-                        _rotate_bbox_to_upright(source, page_size, line.angle),
-                        _rotate_bbox_to_upright(tight, page_size, line.angle),
-                        _rotate_origin_to_upright(origin, page_size, line.angle),
-                        run_key,
-                        font_size,
-                    )
-                )
-            if not entries:
-                continue
-            height_q75 = _quantile([entry[3][3] - entry[3][1] for entry in entries], 0.75)
-            anchors = [entry for entry in entries if entry[3][3] - entry[3][1] >= ANCHOR_MIN_TIGHT_HEIGHT_RATIO * height_q75]
-            for current, following in zip(anchors, anchors[1:]):
-                if current[5] != following[5]:
-                    continue
-                tight_height = max(current[3][3] - current[3][1], following[3][3] - following[3][1])
-                if abs(current[4][1] - following[4][1]) > max(0.5, 0.25 * tight_height):
-                    continue
-                advance = following[4][0] - current[4][0]
-                tight_width = max(current[3][2] - current[3][0], following[3][2] - following[3][0])
-                if not 0.1 < advance <= max(5.0 * max(current[6], 1.0), 8.0 * tight_width):
-                    continue
-                ratio = (current[2][2] - current[2][0]) / advance
-                x_ratios[current[5]].append(ratio)
-                following_width = following[3][2] - following[3][0]
-                if current[2][2] - following[3][0] >= 0.05 * max(following_width, 0.1):
-                    x_overlaps[current[5]] += 1
+        return None
+    from ...._compute_backend import get_native
+    from ....document.pdf.text._contracts import Bbox
 
-            anchors_by_run: dict[RunKey, list[tuple[int, str, BBox, BBox, tuple[float, float], RunKey, float]]] = defaultdict(
-                list
-            )
-            for entry in anchors:
-                anchors_by_run[entry[5]].append(entry)
-            for run_key, run_entries in anchors_by_run.items():
-                style_line_counts[run_key] += 1
-                if _style_line_is_inflated(
-                    line.effective_height,
-                    [entry[6] for entry in run_entries if entry[6] > 0],
-                    [entry[3][3] - entry[3][1] for entry in run_entries],
-                ):
-                    style_inflated_lines[run_key].add(
-                        (page_index, line.source_index),
-                    )
-
-            # 四锚点门槛只约束 Y 分析；短行仍须为文档级 X 统计贡献相邻字符对。
-            if len(anchors) < Y_MIN_ANCHOR_COUNT:
-                continue
-            if line.angle != 0 or line.formula_candidate_only or line.restored_inline_cluster or line.compact_formula_cluster:
-                continue
-            baseline_entries = sorted(anchors, key=lambda entry: entry[4][1])
-            tolerance = max(0.5, 0.25 * height_q75)
-            clusters: list[list[tuple[int, str, BBox, BBox, tuple[float, float], RunKey, float]]] = []
-            for entry in baseline_entries:
-                if not clusters or abs(entry[4][1] - statistics.median(item[4][1] for item in clusters[-1])) > tolerance:
-                    clusters.append([entry])
-                else:
-                    clusters[-1].append(entry)
-            supported = [cluster for cluster in clusters if len(cluster) >= 3 and len(cluster) / len(anchors) >= 0.20]
-            if len(supported) >= 2:
-                return _DocumentGeometryRisk(layout=True)
-            dominant = max(clusters, key=len)
-            if len(dominant) / len(anchors) < Y_DOMINANT_ROW_SHARE:
-                continue
-            source_union = _bbox_union_many([entry[2] for entry in dominant])
-            tight_union = _bbox_union_many([entry[3] for entry in dominant])
-            tight_height = tight_union[3] - tight_union[1]
-            if tight_height <= 0:
-                continue
-            ratio = (source_union[3] - source_union[1]) / tight_height
-            y_ratios.append(ratio)
-            if ratio >= 3.0:
-                y_extreme_runs[Counter(entry[5] for entry in dominant).most_common(1)[0][0]] += 1
-
-    layout_risk = False
-    for run_key, ratios in x_ratios.items():
-        pair_count = len(ratios)
-        if pair_count < X_RELIABLE_PAIR_MIN:
+    native = get_native()
+    records = native.plain_source_records_owned(
+        line.chars,
+        geometry.tight_bboxes,
+        geometry.loose_bboxes,
+        geometry.origins,
+        anchors_only,
+        _is_anchor_text,
+        Bbox,
+    )
+    if records is not None:
+        return records
+    records = []
+    for position, char in enumerate(line.chars):
+        if type(char) is not dict or type(char.get("char")) is not str or type(char.get("char_idx")) is not int:
+            return None
+        text = char["char"]
+        if not _is_anchor_text(text) if anchors_only else not text or not text.isprintable() or text.isspace():
             continue
-        if (
-            statistics.median(ratios) >= X_STRONG_MEDIAN_RATIO
-            and sum(value > X_STRONG_RATIO_THRESHOLD for value in ratios) / pair_count >= X_STRONG_RATIO_SHARE
-            and x_overlaps[run_key] / pair_count >= X_STRONG_NEXT_TIGHT_OVERLAP_SHARE
-        ):
-            layout_risk = True
-            break
-    layout_risk = (
-        layout_risk
-        or bool(y_ratios)
-        and (
-            _quantile(y_ratios, 0.95) >= Y_DOCUMENT_RISK_P95_RATIO
-            or any(count >= Y_MIN_REPEATED_LINES for count in y_extreme_runs.values())
+        rotation = char.get("rotation")
+        if type(rotation) not in (float, type(None)):
+            return None
+        rotation = rotation or 0.0
+        index = char["char_idx"]
+        records.append(
+            (
+                position,
+                raw_bbox(char.get("bbox")),
+                raw_bbox(geometry.loose_bboxes.get(index)) if abs(rotation) > 1e-9 or not math.isfinite(rotation) else None,
+                raw_bbox(geometry.tight_bboxes.get(index)),
+                geometry.origins.get(index),
+                rotation,
+            )
+        )
+    return records
+
+
+def _prepared_line_geometry(line, geometry, page_size, *, anchors_only):
+    """一次筛选并打包原生字符几何，保持风险与 canonical 样本的源顺序。"""
+    from ...._compute_backend import get_native
+    from ._native_geometry import raw_bbox
+
+    native = get_native()
+    if (
+        type(page_size) in (tuple, list)
+        and len(page_size) == 2
+        and all(
+            type(value) is float and math.isfinite(value) or type(value) is int and -(2**53) <= value <= 2**53
+            for value in page_size
+        )
+        and type(line) is _LineItem
+        and type(line.angle) is int
+        and -(2**31) <= line.angle < 2**31
+    ):
+        records = _plain_source_records(line, geometry, anchors_only)
+        if records is not None:
+            prepared = native.source_rows_plain(records, page_size, line.angle)
+            if prepared is not None:
+                for position, values in prepared:
+                    char = line.chars[position]
+                    yield position, char["char"], char["char_idx"], char, values
+                return
+    plain = (
+        type(line) is _LineItem
+        and type(line.chars) is list
+        and type(geometry.tight_bboxes) is dict
+        and type(geometry.origins) is dict
+        and type(geometry.loose_bboxes) is dict
+        and all(
+            type(char) is dict
+            and type(char.get("char")) is str
+            and type(char.get("char_idx")) is int
+            and type(char.get("rotation")) in (float, type(None))
+            and (
+                (origin := geometry.origins.get(char["char_idx"])) is None
+                or type(origin) in (tuple, list)
+                and len(origin) == 2
+                and all(type(value) is float for value in origin)
+            )
+            for char in line.chars
         )
     )
-    style_risk = any(
-        len(inflated_lines) >= STYLE_INFLATION_MIN_LINE_COUNT
-        and len(inflated_lines) / style_line_counts[run_key] >= STYLE_INFLATION_MIN_LINE_SHARE
-        and len({page_index for page_index, _source_index in inflated_lines}) >= STYLE_INFLATION_MIN_PAGE_COUNT
-        for run_key, inflated_lines in style_inflated_lines.items()
-        if style_line_counts[run_key] >= STYLE_INFLATION_MIN_LINE_COUNT
-    )
-    return _DocumentGeometryRisk(
-        layout=layout_risk,
-        style=style_risk,
-    )
+    selected = []
+    sources, sides, tights, origins, rotations = [], [], [], [], []
+    for position, char in enumerate(line.chars):
+        text = str(char.get("char") or "")
+        index = char.get("char_idx")
+        if not _is_anchor_text(text) if anchors_only else not text or not text.isprintable() or text.isspace():
+            continue
+        if isinstance(index, bool) or not isinstance(index, int):
+            continue
+        selected.append((position, text, index, char))
+        if plain:
+            try:
+                rotation = float(char.get("rotation") or 0.0)
+            except (TypeError, ValueError):
+                rotation = math.nan
+            sources.append(raw_bbox(char.get("bbox")))
+            sides.append(
+                raw_bbox(geometry.loose_bboxes.get(index)) if not math.isfinite(rotation) or abs(rotation) > 1e-9 else None
+            )
+            tights.append(raw_bbox(geometry.tight_bboxes.get(index)))
+            origins.append(_coerce_origin(geometry.origins.get(index)))
+            rotations.append(rotation)
+    if not plain:
+        for _position, _text, index, char in selected:
+            try:
+                rotation = float(char.get("rotation") or 0.0)
+            except (TypeError, ValueError):
+                rotation = math.nan
+            sources.append(raw_bbox(char.get("bbox")))
+            sides.append(
+                raw_bbox(geometry.loose_bboxes.get(index)) if not math.isfinite(rotation) or abs(rotation) > 1e-9 else None
+            )
+            tights.append(raw_bbox(geometry.tight_bboxes.get(index)))
+            origins.append(_coerce_origin(geometry.origins.get(index)))
+            rotations.append(rotation)
+    prepared = native.source_rows(sources, sides, tights, origins, rotations, page_size, line.angle, _coerce_bbox)
+    for (position, text, index, char), values in zip(selected, prepared, strict=True):
+        if values is not None:
+            source, tight, origin, local_source, local_tight, local_origin = values
+            yield position, text, index, char, (source, tight, tuple(origin), local_source, local_tight, tuple(local_origin))
+
+
+def _anchor_pair_statistics(rows, positive_source=False):
+    """将字体身份映射为稳定索引，所有相邻锚点统计统一交给原生内核。"""
+    from ...._compute_backend import get_native
+
+    run_ids = {}
+    records = [
+        (run_ids.setdefault(key, len(run_ids)), source, tight, origin, float(size)) for source, tight, origin, key, size in rows
+    ]
+    result = get_native().anchor_pairs(records, positive_source)
+    if result is None:
+        raise ValueError("native anchor statistics rejected normalized geometry")
+    return result
+
+
+def _document_requires_full_geometry(lines_by_page, geometries, page_sizes, *, owned_geometry_inputs=None):
+    """标准数值路径连续累积全文风险，自定义规则明确使用 Python 参考实现。"""
+    from ...._compute_backend import get_native
+
+    native = get_native()
+    if owned_geometry_inputs is not None and (
+        type(owned_geometry_inputs) is not list or len(owned_geometry_inputs) != len(lines_by_page)
+    ):
+        owned_geometry_inputs = None
+    state = native.NativeGeometryRisk()
+    run_table = native.NativeGeometryRuns()
+    run_ids = {}
+    for page_index, (lines, geometry, page_size) in enumerate(zip(lines_by_page, geometries, page_sizes, strict=True)):
+        for line in lines:
+            skip_y = bool(
+                line.angle != 0 or line.formula_candidate_only or line.restored_inline_cluster or line.compact_formula_cluster
+            )
+            owned = owned_geometry_inputs[page_index] if owned_geometry_inputs is not None else None
+            owned_indices = None
+            if owned is not None and run_table is not None:
+                identities = owned[1]
+                if type(line.chars) is not list:
+                    owned_indices = False
+                else:
+                    owned_indices = [identities.get(id(char)) for char in line.chars]
+                    if any(index is None for index in owned_indices):
+                        owned_indices = False
+            if owned_indices is not False and owned is not None and run_table is not None:
+                early = owned[0].add_line(
+                    state,
+                    run_table,
+                    page_index,
+                    line.source_index,
+                    line.effective_height,
+                    skip_y,
+                    owned_indices,
+                    page_size,
+                    line.angle,
+                )
+            elif owned_geometry_inputs is not None:
+                # 批次无法复用时从头统一采用物化后的原生通道，避免 run 身份空间混用。
+                return _document_requires_full_geometry(lines_by_page, geometries, page_sizes)
+            else:
+                font_metadata = _ReadOnlyFontCache()
+                entries = []
+                for _position, text, _char_idx, char, prepared in _prepared_line_geometry(
+                    line, geometry, page_size, anchors_only=True
+                ):
+                    key, size = _font_run_key(char, line.angle, text, font_metadata)
+                    entries.append((run_ids.setdefault(key, len(run_ids)), prepared[3], prepared[4], prepared[5], size))
+                early = state.add_line(
+                    page_index,
+                    line.source_index,
+                    line.effective_height,
+                    skip_y,
+                    entries,
+                )
+            if early is None:
+                raise ValueError("native geometry risk rejected normalized samples")
+            if early:
+                return _DocumentGeometryRisk(layout=True)
+    layout, style = state.finish()
+    return _DocumentGeometryRisk(layout=layout, style=style)
 
 
 def _collect_samples(
@@ -588,25 +703,18 @@ def _collect_samples(
 
     samples: list[_CharSample] = []
     by_line: dict[LineKey, list[_CharSample]] = defaultdict(list)
+    font_metadata = {}
+
+    native_fonts = True
     for page_index, (lines, geometry, page_size) in enumerate(zip(lines_by_page, geometries, page_sizes, strict=True)):
         for line in lines:
-            for position, char in enumerate(line.chars):
-                text = str(char.get("char") or "")
-                char_idx = char.get("char_idx")
-                if (
-                    not text
-                    or not text.isprintable()
-                    or text.isspace()
-                    or isinstance(char_idx, bool)
-                    or not isinstance(char_idx, int)
-                ):
-                    continue
-                source_bbox = _clip_validated_bbox(_source_bbox(char, geometry, char_idx), page_size)
-                tight_bbox = _clip_validated_bbox(_coerce_bbox(geometry.tight_bboxes.get(char_idx)), page_size)
-                origin = _coerce_origin(geometry.origins.get(char_idx))
-                if source_bbox is None or tight_bbox is None or origin is None:
-                    continue
-                run_key, font_size = _font_run_key(char, line.angle, text)
+            if native_fonts:
+                font_metadata = _ReadOnlyFontCache()
+            for position, text, char_idx, char, prepared in _prepared_line_geometry(
+                line, geometry, page_size, anchors_only=False
+            ):
+                source_bbox, tight_bbox, origin, local_source, local_tight, local_origin = prepared
+                run_key, font_size = _font_run_key(char, line.angle, text, font_metadata)
                 sample = _CharSample(
                     page_index=page_index,
                     line=line,
@@ -616,9 +724,9 @@ def _collect_samples(
                     source_bbox=source_bbox,
                     tight_bbox=tight_bbox,
                     origin=origin,
-                    local_source_bbox=_rotate_bbox_to_upright(source_bbox, page_size, line.angle),
-                    local_tight_bbox=_rotate_bbox_to_upright(tight_bbox, page_size, line.angle),
-                    local_origin=_rotate_origin_to_upright(origin, page_size, line.angle),
+                    local_source_bbox=local_source,
+                    local_tight_bbox=local_tight,
+                    local_origin=local_origin,
                     run_key=run_key,
                     font_size=font_size,
                 )
@@ -641,139 +749,15 @@ def _collect_samples(
     return samples, by_line
 
 
-def _build_run_stats(
-    samples: list[_CharSample],
-    by_line: dict[LineKey, list[_CharSample]],
-) -> dict[RunKey, _RunStats]:
-    """统计同 run 相邻 origin advance 与 loose 覆盖下一 tight 的比例。"""
+def _build_run_stats(samples, by_line):
+    """由原生内核连续生成完整字体 run 统计和同族传播结论。"""
+    from ...._compute_backend import get_native
 
-    runs = {key: _RunStats(key=key) for key in {sample.run_key for sample in samples}}
-    for sample in samples:
-        run = runs[sample.run_key]
-        run.samples.append(sample)
-        run.tight_left_bearings.append(sample.local_tight_bbox[0] - sample.local_origin[0])
-
-    for line_samples in by_line.values():
-        anchors = [sample for sample in line_samples if sample.is_anchor]
-        anchors.sort(key=lambda sample: sample.position)
-        for current, following in zip(anchors, anchors[1:]):
-            if current.run_key != following.run_key:
-                continue
-            tight_height = max(
-                current.local_tight_bbox[3] - current.local_tight_bbox[1],
-                following.local_tight_bbox[3] - following.local_tight_bbox[1],
-            )
-            if abs(current.local_origin[1] - following.local_origin[1]) > max(0.5, 0.25 * tight_height):
-                continue
-            advance = following.local_origin[0] - current.local_origin[0]
-            tight_width = max(
-                current.local_tight_bbox[2] - current.local_tight_bbox[0],
-                following.local_tight_bbox[2] - following.local_tight_bbox[0],
-            )
-            limit = max(5.0 * max(current.font_size, 1.0), 8.0 * tight_width)
-            if not 0.1 < advance <= limit:
-                continue
-            source_width = current.local_source_bbox[2] - current.local_source_bbox[0]
-            if source_width <= 0:
-                continue
-            overlap = current.local_source_bbox[2] - following.local_tight_bbox[0]
-            following_width = following.local_tight_bbox[2] - following.local_tight_bbox[0]
-            run = runs[current.run_key]
-            run.pair_ratios.append(source_width / advance)
-            run.pair_overlaps.append(overlap >= 0.05 * max(following_width, 0.1))
-            run.advances.append(advance)
-
-    for run in runs.values():
-        run.median_advance = statistics.median(run.advances) if run.advances else None
-        run.median_tight_left_bearing = statistics.median(run.tight_left_bearings) if run.tight_left_bearings else 0.0
-        pair_count = len(run.pair_ratios)
-        if pair_count < X_RELIABLE_PAIR_MIN:
-            continue
-        median_ratio = statistics.median(run.pair_ratios)
-        large_share = sum(value > X_STRONG_RATIO_THRESHOLD for value in run.pair_ratios) / pair_count
-        overlap_share = sum(run.pair_overlaps) / pair_count
-        run.strong_x_bad = (
-            median_ratio >= X_STRONG_MEDIAN_RATIO
-            and large_share >= X_STRONG_RATIO_SHARE
-            and overlap_share >= X_STRONG_NEXT_TIGHT_OVERLAP_SHARE
-        )
-
-    bad_families = {run.key[0] for run in runs.values() if run.strong_x_bad}
-    for run in runs.values():
-        if run.strong_x_bad or run.key[0] not in bad_families or len(run.pair_ratios) < X_SIBLING_PAIR_MIN:
-            continue
-        median_ratio = statistics.median(run.pair_ratios)
-        overlap_share = sum(run.pair_overlaps) / len(run.pair_overlaps)
-        run.sibling_x_bad = (
-            median_ratio >= X_SIBLING_MEDIAN_RATIO and overlap_share >= X_SIBLING_NEXT_TIGHT_OVERLAP_SHARE
-        ) or _quantile(run.pair_ratios, 0.9) >= X_SIBLING_P90_RATIO
-    return runs
-
-
-def _mark_style_inflated_runs(
-    runs: dict[RunKey, _RunStats],
-) -> set[RunKey]:
-    """标记跨页重复出现且 loose 高度同时偏离字号与 tight 的字体 run。"""
-
-    output: set[RunKey] = set()
-    for run in runs.values():
-        samples_by_line: dict[LineKey, list[_CharSample]] = defaultdict(list)
-        for sample in run.samples:
-            if sample.is_anchor:
-                samples_by_line[(sample.page_index, sample.line.source_index)].append(sample)
-        if len(samples_by_line) < STYLE_INFLATION_MIN_LINE_COUNT:
-            continue
-        inflated_lines: list[LineKey] = []
-        for line_key, line_samples in samples_by_line.items():
-            if _style_line_is_inflated(
-                line_samples[0].line.effective_height,
-                [sample.font_size for sample in line_samples if sample.font_size > 0],
-                [sample.local_tight_bbox[3] - sample.local_tight_bbox[1] for sample in line_samples],
-            ):
-                inflated_lines.append(line_key)
-        if (
-            len(inflated_lines) >= STYLE_INFLATION_MIN_LINE_COUNT
-            and len(inflated_lines) / len(samples_by_line) >= STYLE_INFLATION_MIN_LINE_SHARE
-            and len({page_index for page_index, _source_index in inflated_lines}) >= STYLE_INFLATION_MIN_PAGE_COUNT
-        ):
-            run.style_y_bad = True
-            output.add(run.key)
-    return output
-
-
-def _document_uses_global_style_calibration(
-    style_inflated_runs: set[RunKey],
-) -> bool:
-    """只要存在已通过跨页重复证据的异常 run，就启用全文统一字体尺度。"""
-
-    return bool(style_inflated_runs)
-
-
-def _apply_style_scale_repairs(
-    plan: DocumentGeometryPlan,
-    style_inflated_runs: set[RunKey],
-    by_line: dict[LineKey, list[_CharSample]],
-) -> None:
-    """异常文档触发后统一写入逐行 canonical 字号，不改变公开来源 bbox。"""
-
-    if not style_inflated_runs:
-        return
-    for line_key, line_samples in by_line.items():
-        anchor_samples = [sample for sample in line_samples if sample.is_anchor]
-        if not anchor_samples:
-            continue
-        dominant_run = Counter(sample.run_key for sample in anchor_samples).most_common(1)[0][0]
-        style_samples = [sample for sample in anchor_samples if sample.run_key == dominant_run]
-        font_sizes = [sample.font_size for sample in style_samples if sample.font_size > 0]
-        tight_heights = [sample.local_tight_bbox[3] - sample.local_tight_bbox[1] for sample in style_samples]
-        style_scale = max(
-            statistics.median(font_sizes) if font_sizes else 0.0,
-            _quantile(tight_heights, 0.75),
-            0.1,
-        )
-        if style_scale < STYLE_INFLATION_MIN_SCALE:
-            continue
-        plan.line_style_scales[line_key] = style_scale
+    keys = list({sample.run_key for sample in samples})
+    result = get_native().build_geometry_runs(samples, by_line, keys, _CharSample, _RunStats)
+    if result is None:
+        raise ValueError("native run statistics rejected normalized samples")
+    return result
 
 
 def _line_uses_repaired_style_scale(
@@ -1099,20 +1083,10 @@ def _baseline_clusters(samples: list[_CharSample]) -> tuple[list[list[_CharSampl
 
     tight_heights = [sample.local_tight_bbox[3] - sample.local_tight_bbox[1] for sample in samples]
     tolerance = max(0.5, 0.25 * _quantile(tight_heights, 0.75))
-    clusters: list[list[_CharSample]] = []
-    for sample in sorted(samples, key=lambda item: item.local_origin[1]):
-        target = next(
-            (
-                cluster
-                for cluster in clusters
-                if abs(sample.local_origin[1] - statistics.median(item.local_origin[1] for item in cluster)) <= tolerance
-            ),
-            None,
-        )
-        if target is None:
-            clusters.append([sample])
-        else:
-            target.append(sample)
+    from ._ordered_statistics import ordered_clusters
+
+    groups = ordered_clusters([sample.local_origin[1] for sample in samples], tolerance)
+    clusters = [[samples[index] for index in group] for group in groups]
     return clusters, tolerance
 
 
@@ -1246,39 +1220,24 @@ def _has_document_y_risk(by_line: dict[LineKey, list[_CharSample]]) -> bool:
     )
 
 
-def _same_lane(first: _LineAnalysis, second: _LineAnalysis) -> bool:
-    """用水平覆盖和左边缘近似判断两行是否属于同一栏。"""
-
-    height = max(
-        first.tight_core[3] - first.tight_core[1],
-        second.tight_core[3] - second.tight_core[1],
-    )
-    return _bbox_axis_overlap_ratio(first.local_source_bbox, second.local_source_bbox, axis="x") >= 0.35 or abs(
-        first.local_source_bbox[0] - second.local_source_bbox[0]
-    ) <= 2.0 * max(height, 1.0)
-
-
 def _assign_neighbors(analyses: dict[LineKey, _LineAnalysis]) -> None:
-    """为每条 eligible line 选择上下最近的同栏正文行。"""
+    """由原生内核选择同栏最近正文行，Python 仅保持页分组及原对象引用。"""
+    from ...._compute_backend import get_native
 
     by_page: dict[int, list[_LineAnalysis]] = defaultdict(list)
     for analysis in analyses.values():
         by_page[analysis.key[0]].append(analysis)
     for page_analyses in by_page.values():
-        for current in page_analyses:
-            candidates = [
-                other
-                for other in page_analyses
-                if other is not current
-                and _same_lane(current, other)
-                and abs(other.baseline - current.baseline) >= max(2.0, 0.6 * (current.tight_core[3] - current.tight_core[1]))
+        neighbors = get_native().line_neighbors(
+            [
+                (id(item), item.local_source_bbox, item.tight_core[3] - item.tight_core[1], item.baseline)
+                for item in page_analyses
             ]
-            above = [other for other in candidates if other.baseline < current.baseline]
-            below = [other for other in candidates if other.baseline > current.baseline]
-            if above:
-                current.neighbors.append(max(above, key=lambda other: other.baseline))
-            if below:
-                current.neighbors.append(min(below, key=lambda other: other.baseline))
+        )
+        if neighbors is None:
+            raise ValueError("native neighbor analysis rejected normalized geometry")
+        for item, pair in zip(page_analyses, neighbors, strict=True):
+            item.neighbors.extend(page_analyses[index] for index in pair if index is not None)
 
 
 def _intrusion_ratio(source_bbox: BBox, tight_core: BBox) -> float:
@@ -1544,57 +1503,342 @@ def _run_diagnostics(runs: dict[RunKey, _RunStats]) -> list[dict[str, Any]]:
     return output
 
 
+def _prepare_run_style(plan, samples, by_line, *, restore_pages=None):
+    """复用一次原生样本读取，连续计算 run、全文样式与可选字符恢复。"""
+    from ...._compute_backend import get_native
+    from ....document.pdf.text._contracts import Bbox as CharacterBbox
+
+    keys = list({sample.run_key for sample in samples})
+    result = get_native().build_geometry_style(
+        samples, by_line, keys, _CharSample, _RunStats, _LineItem, restore_pages, CharacterBbox
+    )
+    if result is None:
+        raise ValueError("native style analysis rejected normalized samples")
+    runs, inflated, scales, restored = result
+    plan.style_inflated_runs = inflated
+    plan.document_style_anomaly = bool(inflated)
+    plan.line_style_scales.update(scales)
+    return runs, inflated, restored
+
+
+def _prepare_owned_document(lines_by_page, geometries, page_sizes, *, layout=False, with_metrics=False):
+    """自有 Rust 文档连续完成样本、锚点、run 和样式，仅为后续布局规则物化一次字符。"""
+    from ...._compute_backend import get_native
+
+    native = get_native()
+    document = native.NativeStyleDocument(layout)
+    run_ids, run_keys = {}, []
+    for page_index, (lines, geometry, page_size) in enumerate(zip(lines_by_page, geometries, page_sizes, strict=True)):
+        if (
+            type(geometry) is not PDFPageTextGeometry
+            or any(type(values) is not dict for values in (geometry.tight_bboxes, geometry.origins, geometry.loose_bboxes))
+            or type(page_size) not in (tuple, list)
+            or len(page_size) != 2
+            or not all(type(v) is float and math.isfinite(v) or type(v) is int and -(2**53) <= v <= 2**53 for v in page_size)
+        ):
+            return None
+        for line in lines:
+            if (
+                type(line) is not _LineItem
+                or (
+                    with_metrics
+                    and any(
+                        type(value) is not bool
+                        for value in (line.formula_candidate_only, line.compact_formula_cluster, line.restored_inline_cluster)
+                    )
+                )
+                or type(line.angle) is not int
+                or not -(2**31) <= line.angle < 2**31
+                or type(line.source_index) is not int
+                or not -(2**63) <= line.source_index < 2**63
+                or not (
+                    type(line.effective_height) is float
+                    and math.isfinite(line.effective_height)
+                    or type(line.effective_height) is int
+                    and -(2**53) <= line.effective_height <= 2**53
+                )
+            ):
+                return None
+            records = _plain_source_records(line, geometry, anchors_only=False)
+            if records is None:
+                return None
+
+            def metadata(positions):
+                """只为坐标合法的字符编码字体和 Unicode 类别，与原样本准入顺序一致。"""
+                return native.owned_font_run_metadata(
+                    line.chars,
+                    positions,
+                    line.angle,
+                    run_ids,
+                    run_keys,
+                    _font_run_metadata,
+                    _script_group,
+                    _cached_run_key,
+                    _is_anchor_text,
+                    layout,
+                )
+
+            if not document.add_line(
+                records,
+                page_size,
+                line.angle,
+                page_index,
+                line.source_index,
+                line.effective_height,
+                metadata,
+                line if layout else None,
+            ):
+                return None
+    family_ids = {}
+    families = [family_ids.setdefault(key[0], len(family_ids)) for key in run_keys]
+    if layout:
+
+        def release_side_maps():
+            """原生阶段接受输入后，在最终字符物化之前释放已复制的 loose 侧表。"""
+            for geometry in geometries:
+                geometry.loose_bboxes.clear()
+
+        result = document.finish_layout(
+            families, run_keys, _CharSample, _RunStats, release_side_maps, with_metrics, sys.version_info >= (3, 12)
+        )
+        if result is None:
+            return None
+        samples, by_line, runs, inflated, scales = result[:5]
+        # 保留旧 set comprehension 的 run 顺序，避免同族 donor 并列时改变选择。
+        runs = {key: runs[key] for key in {key for key in run_keys} if key in runs}
+        if with_metrics:
+            metrics, reports = result[5]
+            return samples, by_line, runs, inflated, scales, (metrics, _native_run_diagnostics(run_keys, reports))
+        return samples, by_line, runs, inflated, scales
+    result = document.finish(families)
+    if result is None:
+        return None
+    inflated, scales, rows = result
+    plan = DocumentGeometryPlan(
+        style_inflated_runs={run_keys[index] for index in inflated},
+        document_style_anomaly=bool(inflated),
+        line_style_scales=dict(scales),
+    )
+    plan.run_diagnostics = _native_run_diagnostics(run_keys, rows)
+    # 只有整本文档成功消费后才清理侧表，拒绝输入时仍能完整执行参考路径。
+    for geometry in geometries:
+        geometry.loose_bboxes.clear()
+    return plan
+
+
+def _native_run_diagnostics(run_keys, rows):
+    """仅在输出边界将原生 run 数值转换为既有诊断字段与排序。"""
+    diagnostics = []
+    for row in sorted(rows, key=lambda row: run_keys[row[0]]):
+        index, count, pairs, median_ratio, p90, large_share, overlap_share, strong, sibling, style = row
+        diagnostics.append(
+            {
+                "run_key": list(run_keys[index]),
+                "sample_count": count,
+                "reliable_pair_count": pairs,
+                "median_ratio": median_ratio,
+                "p90_ratio": p90,
+                "ratio_gt_1_35_share": large_share,
+                "next_tight_overlap_share": overlap_share,
+                "strong_x_bad": strong,
+                "sibling_x_bad": sibling,
+                "style_y_bad": style,
+            }
+        )
+    return diagnostics
+
+
+def _prepare_style_only_document(lines_by_page, geometries, page_sizes):
+    """样式分支只生成最终计划，不构造逐字符 Python 对象。"""
+    return _prepare_owned_document(lines_by_page, geometries, page_sizes)
+
+
+def _prepare_layout_document(lines_by_page, geometries, page_sizes, *, with_metrics=False):
+    """布局分支只在 X/Y 规则边界物化一次已计算完统计的字符数据。"""
+    return _prepare_owned_document(lines_by_page, geometries, page_sizes, layout=True, with_metrics=with_metrics)
+
+
+def _repair_extreme_local_font_metrics(plan, by_line, page_sizes):
+    """用同页重复异常与健康同族行校准极端字体矩阵，不放宽普通跨页样式阈值。"""
+    groups = defaultdict(list)
+    families = {}
+
+    def family_name(name):
+        """同一输入状态的字体后缀只解析一次，缓存仅属于当前文档几何修复。"""
+        if name not in families:
+            families[name] = re.sub(r"(?:semibold|demibold|regular|regu|bold|light|medium|italic|ital|oblique)+$", "", name)
+        return families[name]
+
+    for key, samples in by_line.items():
+        anchors = [sample for sample in samples if sample.is_anchor]
+        if len(anchors) < 4:
+            continue
+        dominant = Counter(sample.run_key for sample in anchors).most_common(1)[0][0]
+        family = family_name(dominant[0])
+        # 描述标志、数字及希腊字符可在同一字体矩阵内变换，不应阻止正文行的尺度校准。
+        members = [
+            sample
+            for sample in anchors
+            if family_name(sample.run_key[0]) == family
+            and sample.run_key[1] == dominant[1]
+            and sample.run_key[4] == dominant[4]
+        ]
+        if len(members) < 0.8 * len(anchors):
+            continue
+        height = _quantile([s.local_tight_bbox[3] - s.local_tight_bbox[1] for s in members], 0.75)
+        baseline = statistics.median(s.local_origin[1] for s in members)
+        if height <= 0 or sum(abs(s.local_origin[1] - baseline) <= 0.2 * height for s in members) < 0.85 * len(members):
+            continue
+        # 通用强调后缀只用于寻找健康同族几何，不把某个字体名称写成例外。
+        groups[key[0], family, dominant[1], dominant[4]].append((key, members, height, baseline))
+    for group in groups.values():
+        bad = [
+            row
+            for row in group
+            if row[1][0].line.effective_height >= 4 * row[2] and statistics.median(s.font_size for s in row[1]) <= 0.3 * row[2]
+        ]
+        if len(bad) < 6 or len(bad) < 0.6 * len(group):
+            continue
+        donors = [row for row in group if len(row[1]) >= 12 and 1.2 <= row[1][0].line.effective_height / row[2] <= 2.5]
+        if not donors:
+            continue
+        ascent = statistics.median((row[3] - row[1][0].local_source_bbox[1]) / row[2] for row in donors)
+        descent = statistics.median((row[1][0].local_source_bbox[3] - row[3]) / row[2] for row in donors)
+        if ascent <= 0 or descent < 0 or not 1.2 <= ascent + descent <= 2.5:
+            continue
+        for key, members, height, baseline in bad:
+            samples = by_line[key]
+            line = members[0].line
+            size = page_sizes[key[0]]
+            ink = _bbox_union_many([s.tight_bbox for s in samples])
+            local_ink = _rotate_bbox_to_upright(ink, size, line.angle)
+            local_source = _rotate_bbox_to_upright(line.bbox, size, line.angle)
+            local_layout = (
+                local_source[0],
+                min(local_ink[1], baseline - ascent * height),
+                local_source[2],
+                max(local_ink[3], baseline + descent * height),
+            )
+            layout = _clip_bbox(_rotate_bbox_from_upright(local_layout, size, line.angle), size)
+            if layout is None:
+                continue
+            scale = height * (ascent + descent)
+            old = plan.line_repairs.get(key)
+            plan.line_repairs[key] = LineGeometryRepair(
+                source_bbox=line.source_bbox or line.bbox,
+                layout_bbox=layout,
+                ink_bbox=ink,
+                baseline=baseline,
+                em_height=scale,
+                state="repair_xy" if old and old.state in {"repair_x", "repair_xy"} else "trim_y",
+                confidence=1.0,
+                run_key=members[0].run_key,
+            )
+            plan.line_style_scales[key] = scale
+            plan.local_metric_repair_sources.add(key)
+            # 字符与行共同回到同一基线包络，避免后续脚本/视觉行重分割又读回巨大原生字框。
+            for sample in samples:
+                if sample.local_source_bbox[3] - sample.local_source_bbox[1] < 4 * height:
+                    continue
+                old_char = plan.char_repairs.get((key[0], sample.char_idx))
+                char_local = _rotate_bbox_to_upright(old_char.layout_bbox if old_char else sample.source_bbox, size, line.angle)
+                delta = sample.local_origin[1] - baseline
+                char_layout = _clip_bbox(
+                    _rotate_bbox_from_upright(
+                        (
+                            char_local[0],
+                            min(local_layout[1] + delta, sample.local_tight_bbox[1]),
+                            char_local[2],
+                            max(local_layout[3] + delta, sample.local_tight_bbox[3]),
+                        ),
+                        size,
+                        line.angle,
+                    ),
+                    size,
+                )
+                if char_layout is None:
+                    continue
+                plan.char_repairs[key[0], sample.char_idx] = CharLayoutGeometry(
+                    source_bbox=sample.source_bbox,
+                    tight_bbox=sample.tight_bbox,
+                    origin=sample.origin,
+                    layout_bbox=char_layout,
+                    ink_bbox=sample.tight_bbox,
+                    baseline=sample.local_origin[1],
+                    advance=old_char.advance if old_char else None,
+                    em_height=scale,
+                    x_state=old_char.x_state if old_char else "healthy",
+                    y_state="abnormal",
+                    confidence=1.0,
+                )
+
+
 def build_document_geometry_plan(
     lines_by_page: list[list[_LineItem]],
     geometries: list[PDFPageTextGeometry],
     page_sizes: list[tuple[float, float]],
+    *,
+    owned_geometry_inputs: list[Any] | None = None,
 ) -> DocumentGeometryPlan:
     """构建文档级 X 修复、Y trim 与 split shadow 计划。"""
 
     plan = DocumentGeometryPlan()
     if not any(geometry.tight_bboxes and geometry.origins for geometry in geometries):
         return plan
-    risk = _document_requires_full_geometry(
-        lines_by_page,
-        geometries,
-        page_sizes,
-    )
+    if owned_geometry_inputs is None:
+        # 保持既有单页/测试替身签名；只有主链路显式提供页面级 evidence 才传私有参数。
+        risk = _document_requires_full_geometry(lines_by_page, geometries, page_sizes)
+    else:
+        risk = _document_requires_full_geometry(
+            lines_by_page,
+            geometries,
+            page_sizes,
+            owned_geometry_inputs=owned_geometry_inputs,
+        )
     if not risk.any:
         for geometry in geometries:
             geometry.loose_bboxes.clear()
         return plan
-    samples, by_line = _collect_samples(lines_by_page, geometries, page_sizes)
-    if risk.layout:
-        # 只有布局风险才记录公开输出候选；仅样式异常时只校准内部字号。
-        _record_line_canonical_metrics(plan, by_line)
-    runs = _build_run_stats(samples, by_line)
-    style_inflated_runs = _mark_style_inflated_runs(runs)
-    plan.style_inflated_runs = style_inflated_runs
-    plan.document_style_anomaly = _document_uses_global_style_calibration(
-        style_inflated_runs,
-    )
-    _apply_style_scale_repairs(
-        plan,
-        style_inflated_runs if plan.document_style_anomaly else set(),
-        by_line,
-    )
-    if plan.document_style_anomaly and risk.layout:
-        _restore_stable_legacy_source_bboxes(by_line, page_sizes)
-        runs = _build_run_stats(samples, by_line)
-        for run in runs.values():
-            run.style_y_bad = run.key in style_inflated_runs
-    plan.run_diagnostics = _run_diagnostics(runs)
+    if not risk.layout:
+        native_plan = _prepare_style_only_document(lines_by_page, geometries, page_sizes)
+        if native_plan is not None:
+            return native_plan
+    prepared = _prepare_layout_document(lines_by_page, geometries, page_sizes, with_metrics=True) if risk.layout else None
+    native_y_risk = None
+    if prepared is not None:
+        samples, by_line, runs, inflated, scales, (metrics, diagnostics) = prepared
+        plan.style_inflated_runs = inflated
+        plan.document_style_anomaly = bool(inflated)
+        plan.line_style_scales.update(scales)
+        inks, baselines, native_y_risk = metrics
+        plan.line_ink_bboxes.update((key, tuple(box)) for key, box in inks)
+        plan.line_baselines.update(baselines)
+        plan.run_diagnostics = diagnostics
+    else:
+        samples, by_line = _collect_samples(lines_by_page, geometries, page_sizes)
+        if risk.layout:
+            # 只有布局风险才记录公开输出候选；仅样式异常时只校准内部字号。
+            _record_line_canonical_metrics(plan, by_line)
+        runs, style_inflated_runs, restored = _prepare_run_style(
+            plan,
+            samples,
+            by_line,
+            restore_pages=page_sizes if risk.layout else None,
+        )
+    if prepared is None:
+        plan.run_diagnostics = _run_diagnostics(runs)
     if not risk.layout:
         return plan
     x_bad_runs = {run.key for run in runs.values() if run.strong_x_bad or run.sibling_x_bad}
     if x_bad_runs:
         _repair_x_chars(plan, runs, by_line, page_sizes)
         _build_line_repairs_from_x(plan, lines_by_page, by_line, page_sizes)
-    if not _has_document_y_risk(by_line):
+    if not (native_y_risk if native_y_risk is not None else _has_document_y_risk(by_line)):
         return plan
     analyses = _analyze_lines(lines_by_page, by_line, page_sizes)
     confirmed_runs = _mark_y_candidates(analyses)
     _repair_y_lines(plan, analyses, confirmed_runs, x_bad_runs, page_sizes)
+    _repair_extreme_local_font_metrics(plan, by_line, page_sizes)
     return plan
 
 
@@ -1623,14 +1867,19 @@ def apply_line_geometry_repairs(
         )
         if style_scale is not None:
             line.em_height = style_scale
-        line.style_scale_repaired = _line_uses_repaired_style_scale(
+        line.style_scale_repaired = (
+            page_index,
+            line.source_index,
+        ) in plan.local_metric_repair_sources or _line_uses_repaired_style_scale(
             line,
             plan.style_inflated_runs,
         )
         repair = plan.line_repairs.get((page_index, line.source_index))
         if repair is None:
             continue
-        if repair.state in {"trim_y", "repair_xy"} and not allow_y_trim:
+        # 极端局部异常已有健康同族行与六行重复证据，可在表格/图片成员认领前缩回真实行带。
+        local_metric_repair = (page_index, line.source_index) in plan.local_metric_repair_sources
+        if repair.state in {"trim_y", "repair_xy"} and not allow_y_trim and not local_metric_repair:
             if repair.state == "trim_y":
                 continue
             local_state = "repair_x"
@@ -1648,7 +1897,7 @@ def apply_line_geometry_repairs(
         line.split_y_candidate = repair.split_y_candidate
         line.bbox = layout
         line.em_height = style_scale if style_scale is not None else repair.em_height
-        if allow_y_trim and repair.state in {"trim_y", "repair_xy"}:
+        if (allow_y_trim or local_metric_repair) and repair.state in {"trim_y", "repair_xy"}:
             line.effective_height = repair.em_height
 
 

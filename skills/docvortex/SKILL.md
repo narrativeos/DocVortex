@@ -33,7 +33,14 @@ python --version
 python -c "import docvortex; print(docvortex.__version__); print(docvortex.__file__)"
 ```
 
-DocVortex supports Python 3.10–3.14. If the package is missing, install it into the
+DocVortex supports GIL-enabled CPython 3.11–3.14 and requires pypdfium2 >=5.13.0 and ONNX Runtime >=1.24.4 (DirectML on
+Windows x64). Since 0.6.0, macOS requires Apple Silicon and macOS 14 or newer;
+Intel Macs are not supported. Releases provide platform wheels only, with a required
+Rust native extension; PyPy, free-threaded Python, pure Python wheels and sdist installs
+are not supported. The current checkout ignores `DOCVORTEX_BUILD_NATIVE` and
+`DOCVORTEX_COMPUTE_BACKEND` for all values, without modifying the variables or warning.
+This compatibility fix is not released yet; the published 0.6.0 package still rejects these variables.
+If the package is missing, install it into the
 chosen environment with `python -m pip install docvortex`. The examples use the
 public SDK available in DocVortex 0.4.2. For a repository task, verify that imports
 resolve to the intended checkout rather than an older installed copy.

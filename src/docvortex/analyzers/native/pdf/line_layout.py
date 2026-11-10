@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import math
 import re
 import statistics
 from typing import Sequence
 
 from ....foundation._text import is_hyphen_at_line_end
 from ....schema import BBox
+from ...._compute_backend import get_native
 from .geometry import (
     _bbox_axis_overlap_ratio,
     _bbox_center_x,
@@ -19,6 +19,7 @@ from .geometry import (
     _coerce_bbox,
 )
 from .models import _LineItem, _LocalAxisLine, _TextLane
+from .inline.types import PDF_FONT_ITALIC_FLAG
 from .typography import _normalized_font_family
 
 _TIGHT_OUTPUT_PADDING = 1.0
@@ -49,6 +50,14 @@ def _font_signatures_share_family(
     return first_family is not None and second_family is not None and first_family == second_family
 
 
+def _font_signatures_share_emphasis_family(first: tuple[str, int], second: tuple[str, int]) -> bool:
+    """仅在已确认的正文强调续行中忽略通用字重/斜体后缀，不改变标题或其他字体兼容规则。"""
+    style_suffix = r"(?:semibold|demibold|regular|regu|roman|bold|light|medium|italic|ital|oblique)+$"
+    first_family = re.sub(style_suffix, "", _normalized_font_family(first) or "")
+    second_family = re.sub(style_suffix, "", _normalized_font_family(second) or "")
+    return bool(first_family) and first_family == second_family
+
+
 def _font_weights_conflict(first: _LineItem, second: _LineItem) -> bool:
     """判断两行是否存在足以构成段落硬边界的显著字重差异。"""
 
@@ -75,6 +84,14 @@ def _should_connect_semantic_rows(
     current_line, current_bbox = current
     if previous_line.semantic_type != current_line.semantic_type:
         return False
+    if (
+        current_line.semantic_type == "paragraph_title"
+        and current_line.explicit_section_title
+        and current_line.title_band_id is not None
+        and current_line.title_band_id != previous_line.title_band_id
+    ):
+        # 已确认的独立编号标题带构成永久边界，连续两级标题不能因紧排而粘连。
+        return False
     if _connection_crosses_table(previous_line.bbox, current_line.bbox, table_bboxes):
         return False
     if _horizontal_rule_separates_rows(previous_bbox, current_bbox, lane, axis_lines):
@@ -82,12 +99,13 @@ def _should_connect_semantic_rows(
     previous_height = _line_effective_height(previous_line, previous_bbox)
     current_height = _line_effective_height(current_line, current_bbox)
     pair_height = max(previous_height, current_height)
-    if max(previous_height, current_height) / min(previous_height, current_height) > 1.35:
+    shared_title_band = previous_line.title_band_id is not None and previous_line.title_band_id == current_line.title_band_id
+    confirmed_title_band = shared_title_band and previous_line.structural_title and current_line.structural_title
+    if max(previous_height, current_height) / min(previous_height, current_height) > 1.35 and not confirmed_title_band:
         return False
     vertical_gap = _effective_text_row_gap(previous, current)
     if not -0.25 * pair_height <= vertical_gap <= max(1.25 * pair_height, regular_gap + 0.75 * pair_height):
         return False
-    shared_title_band = previous_line.title_band_id is not None and previous_line.title_band_id == current_line.title_band_id
     if previous_line.semantic_type == "paragraph_title" and vertical_gap > 0.5 * pair_height and not shared_title_band:
         return False
     font_conflicts = (
@@ -106,7 +124,11 @@ def _should_connect_semantic_rows(
             or abs(previous_line.dominant_font_weight - current_line.dominant_font_weight) < 100.0
         )
     )
-    if font_conflicts and not uncertain_document_title_font:
+    if (
+        font_conflicts
+        and not uncertain_document_title_font
+        and not (shared_title_band and previous_line.structural_title and current_line.structural_title)
+    ):
         return False
     lane_width = max(0.1, lane.right - lane.left)
     centered_pair = abs(_bbox_center_x(previous_bbox) - _bbox_center_x(current_bbox)) <= 0.15 * lane_width
@@ -135,10 +157,8 @@ def _line_canonical_style_scale(line: _LineItem, local_bbox: BBox) -> float:
     )
 
 
-def _line_effective_height(line: _LineItem, local_bbox: BBox) -> float:
-    """兼容既有布局调用，并统一转发到 canonical 字体尺度。"""
-
-    return _line_style_scale(line, local_bbox)
+# 兼容既有私有入口，直接绑定同一实现，避免高频布局检查多经过一层 Python 转发。
+_line_effective_height = _line_style_scale
 
 
 def _line_layout_height(_line: _LineItem, local_bbox: BBox) -> float:
@@ -230,6 +250,30 @@ def _effective_body_text_row_gap(
     return _effective_text_row_gap(previous, current)
 
 
+def _lane_batch_native():
+    """布局计算统一读取必需的原生扩展。"""
+    return get_native()
+
+
+def _supported_lane_intervals_native(line_geometry, width, median_height):
+    """完整输入只读一次，锚点与中位数由 Rust 批量生成。"""
+    native = _lane_batch_native()
+    return native.supported_lane_intervals_owned(line_geometry, width, median_height, _LineItem)
+
+
+def _lane_assignments_native(line_geometry, lanes, tolerance, nested=None):
+    """分栏时重新读取当前几何，不复用先前阶段的成员或判定结果。"""
+    native = _lane_batch_native()
+    return native.lane_assignments_owned(
+        line_geometry,
+        lanes,
+        tolerance,
+        nested,
+        _LineItem,
+        _TextLane,
+    )
+
+
 def _infer_text_lanes(
     line_geometry: list[tuple[_LineItem, BBox]],
     local_page_width: float,
@@ -240,56 +284,11 @@ def _infer_text_lanes(
     """从重复左右边缘推断稳定栏带，并按需用已分配成员重算边界。"""
 
     anchor_tolerance = max(3.0, 0.75 * median_height)
-    anchor_geometry = [
-        item for item in line_geometry if item[0].semantic_type not in {"header", "footer", "page_number", "aside_text"}
-    ]
-    regular_lines = [
-        item
-        for item in anchor_geometry
-        if item[1][2] - item[1][0] >= max(4.0 * _line_effective_height(*item), 0.15 * local_page_width)
-    ]
-    left_clusters: list[list[tuple[_LineItem, BBox]]] = []
-    for item in sorted(regular_lines, key=lambda value: value[1][0]):
-        if not left_clusters:
-            left_clusters.append([item])
-            continue
-        cluster_left = statistics.median(member[1][0] for member in left_clusters[-1])
-        if abs(item[1][0] - cluster_left) <= anchor_tolerance:
-            left_clusters[-1].append(item)
-        else:
-            left_clusters.append([item])
-
-    supported_intervals = [
-        (
-            statistics.median(item[1][0] for item in cluster),
-            statistics.median(item[1][2] for item in cluster),
-            len(cluster),
-        )
-        for cluster in left_clusters
-        if len(cluster) >= 3
-    ]
-    supported_intervals.sort(key=lambda interval: interval[0])
-    filtered_intervals: list[tuple[float, float, int]] = []
-    for interval in supported_intervals:
-        if not filtered_intervals:
-            filtered_intervals.append(interval)
-            continue
-        previous = filtered_intervals[-1]
-        minimum_gutter = max(6.0, 0.75 * median_height)
-        if interval[0] - previous[1] >= minimum_gutter:
-            filtered_intervals.append(interval)
-        elif interval[2] > previous[2]:
-            filtered_intervals[-1] = interval
-
-    if not filtered_intervals:
-        source = regular_lines or line_geometry
-        filtered_intervals = [
-            (
-                min(item[1][0] for item in source),
-                max(item[1][2] for item in source),
-                len(source),
-            )
-        ]
+    supported = _supported_lane_intervals_native(line_geometry, local_page_width, median_height)
+    if supported is None:
+        raise ValueError("native lane inference rejected normalized geometry")
+    filtered_intervals, anchor_indices = supported
+    anchor_geometry = [line_geometry[i] for i in anchor_indices]
 
     nested_column_band = None
     if len(filtered_intervals) == 1 and anchor_geometry:
@@ -315,41 +314,16 @@ def _infer_text_lanes(
             right=filtered_intervals[0][1],
         )
         span_lines: list[tuple[_LineItem, BBox]] = []
-        for item in line_geometry:
-            line, bbox = item
-            center_y = _bbox_center_y(bbox)
-            if (
-                line.semantic_type in {"header", "footer", "page_number", "page_footnote", "aside_text"}
-                or not band_top <= center_y <= band_bottom
-            ):
+        destinations = _lane_assignments_native(line_geometry, nested_lanes, anchor_tolerance, (band_top, band_bottom))
+        if destinations is None:
+            raise ValueError("native lane assignment rejected normalized geometry")
+        for item, target in zip(line_geometry, destinations):
+            if target is None:
+                span_lines.append(item)
+            elif target == len(nested_lanes):
                 fallback_lane.lines.append(item)
-                continue
-            line_width = max(0.1, bbox[2] - bbox[0])
-            scored_lanes = [
-                (
-                    max(0.0, min(bbox[2], lane.right) - max(bbox[0], lane.left)) / line_width,
-                    lane,
-                )
-                for lane in nested_lanes
-            ]
-            coverage_scores = sorted(
-                (coverage for coverage, _lane in scored_lanes),
-                reverse=True,
-            )
-            best_coverage, best_lane = max(scored_lanes, key=lambda value: value[0])
-            fits_only_one_lane = _fits_only_one_lane(
-                bbox,
-                best_lane,
-                nested_lanes,
-                anchor_tolerance,
-            )
-            if len(coverage_scores) > 1 and coverage_scores[1] >= 0.2 and not fits_only_one_lane:
-                span_lines.append(item)
-                continue
-            if best_coverage >= 0.5 or fits_only_one_lane:
-                best_lane.lines.append(item)
             else:
-                span_lines.append(item)
+                nested_lanes[target].lines.append(item)
         lanes = [lane for lane in nested_lanes if lane.lines]
         if recalculate_intervals:
             _expand_nested_lane_intervals_from_members(
@@ -373,36 +347,14 @@ def _infer_text_lanes(
 
     lanes = [_TextLane(left=left, right=right) for left, right, _support in filtered_intervals]
     span_lines: list[tuple[_LineItem, BBox]] = []
-    for item in line_geometry:
-        bbox = item[1]
-        line_width = max(0.1, bbox[2] - bbox[0])
-        scored_lanes = [
-            (
-                max(0.0, min(bbox[2], lane.right) - max(bbox[0], lane.left)) / line_width,
-                lane,
-            )
-            for lane in lanes
-        ]
-        coverage_scores = sorted(
-            (coverage for coverage, _lane in scored_lanes),
-            reverse=True,
-        )
-        best_coverage, best_lane = max(scored_lanes, key=lambda value: value[0])
-        fits_only_one_lane = _fits_only_one_lane(
-            bbox,
-            best_lane,
-            lanes,
-            anchor_tolerance,
-        )
-        # 同时覆盖两个稳定正文栏的行仍属于跨栏内容；只进入单侧栏且未越过栏沟的
-        # 宽正文行则回到该栏，避免窄图注把正文错误挤入 span lane。
-        if len(coverage_scores) > 1 and coverage_scores[1] >= 0.2 and not fits_only_one_lane:
+    destinations = _lane_assignments_native(line_geometry, lanes, anchor_tolerance)
+    if destinations is None:
+        raise ValueError("native lane assignment rejected normalized geometry")
+    for item, target in zip(line_geometry, destinations):
+        if target is None:
             span_lines.append(item)
-            continue
-        if len(lanes) == 1 or fits_only_one_lane:
-            best_lane.lines.append(item)
         else:
-            span_lines.append(item)
+            lanes[target].lines.append(item)
 
     if recalculate_intervals:
         _expand_nested_lane_intervals_from_members(
@@ -423,21 +375,57 @@ def _infer_text_lanes(
     return lanes
 
 
-def _fits_only_one_lane(
+def _best_lane_coverage(
+    bbox: BBox,
+    lanes: list[_TextLane],
+) -> tuple[_TextLane, float, float]:
+    """一次遍历求最佳栏覆盖与次高覆盖，平局保留原有首个最佳栏。"""
+
+    line_width = max(0.1, bbox[2] - bbox[0])
+    best_lane = lanes[0]
+    best_coverage = -1.0
+    second_coverage = -1.0
+    for lane in lanes:
+        coverage = max(0.0, min(bbox[2], lane.right) - max(bbox[0], lane.left)) / line_width
+        if coverage > best_coverage:
+            second_coverage = best_coverage
+            best_coverage = coverage
+            best_lane = lane
+        elif coverage > second_coverage:
+            second_coverage = coverage
+    return best_lane, best_coverage, second_coverage
+
+
+def _fits_only_one_lane_ordered(
     bbox: BBox,
     best_lane: _TextLane,
-    lanes: list[_TextLane],
+    ordered: list[_TextLane],
     tolerance: float,
 ) -> bool:
-    """判断宽行是否仍完整停留在某一栏及其栏沟边界以内。"""
+    """在调用方预排序的栏序列上判断宽行是否只停留在一个栏内。"""
 
-    ordered = sorted(lanes, key=lambda lane: lane.left)
     lane_index = ordered.index(best_lane)
     if lane_index > 0 and bbox[0] < ordered[lane_index - 1].right - tolerance:
         return False
     if lane_index + 1 < len(ordered) and bbox[2] > ordered[lane_index + 1].left - 0.25 * tolerance:
         return False
     return best_lane.left - tolerance <= _bbox_center_x(bbox) <= best_lane.right + max(tolerance, bbox[2] - best_lane.right)
+
+
+def _fits_only_one_lane(
+    bbox: BBox,
+    best_lane: _TextLane,
+    lanes: list[_TextLane],
+    tolerance: float,
+) -> bool:
+    """保留旧内部入口；独立调用仍自行排序，输出与预排序版完全一致。"""
+
+    return _fits_only_one_lane_ordered(
+        bbox,
+        best_lane,
+        sorted(lanes, key=lambda lane: lane.left),
+        tolerance,
+    )
 
 
 def _expand_nested_lane_intervals_from_members(
@@ -679,70 +667,25 @@ def _reattach_span_lane_continuations(
             span_lane.lines.sort(key=lambda item: (item[1][1], item[1][0], item[0].source_index))
 
 
-def _lane_accepts_short_tail(
-    candidate: tuple[_LineItem, BBox],
-    lane: _TextLane,
-    median_height: float,
-) -> bool:
-    """用同一组前序行证据判断当前栏或其他栏是否能够接纳正文短尾。"""
+def _reattach_cross_lane_short_tails(lanes: list[_TextLane], median_height: float) -> None:
+    """由原生事件扫描确定跨栏短尾归属，Python 只迁移原有行对象。"""
+    if len(lanes) < 2:
+        return
+    if not _short_tail_lane_events_native(lanes, median_height):
+        raise ValueError("native short-tail assignment rejected normalized lanes")
 
-    candidate_line, candidate_bbox = candidate
-    preceding = [
-        item for item in lane.lines if item[0].semantic_type == candidate_line.semantic_type and item[1][1] < candidate_bbox[1]
-    ]
-    if not preceding:
+
+def _short_tail_lane_events_native(lanes, median_height):
+    """验证和几何快照一并交给 Rust；完成快照后只迁移原始行对象。"""
+    native = get_native()
+    moves = native.short_tail_lane_events(lanes, median_height, _TextLane, _LineItem)
+    if moves is None:
         return False
-    # 同位置前序行按栏内稳定排序取 source_index 较小者，避免后续插入触发排序后改变已用证据。
-    previous = max(preceding, key=lambda item: (item[1][1], item[1][0], -item[0].source_index))
-    previous_line, previous_bbox = previous
-    pair_height = max(
-        _line_effective_height(*previous),
-        _line_effective_height(*candidate),
-        median_height,
-    )
-    lane_width = max(0.1, lane.right - lane.left)
-    if (
-        previous_bbox[2] - previous_bbox[0] < 0.65 * lane_width
-        or candidate_bbox[2] - candidate_bbox[0] > 0.85 * lane_width
-        or candidate_bbox[0] < lane.left - 0.75 * pair_height
-        or candidate_bbox[2] > lane.right + 0.75 * pair_height
-        or abs(candidate_bbox[0] - previous_bbox[0]) > 0.75 * pair_height
-        or not _title_fonts_compatible(previous_line, candidate_line)
-    ):
-        return False
-    gap = _effective_body_text_row_gap(previous, candidate)
-    if not -0.25 * pair_height <= gap <= 0.9 * pair_height:
-        return False
-    if (
-        previous_line.visual_row_id is not None
-        and candidate_line.visual_row_id is not None
-        and not 0 < candidate_line.visual_row_id - previous_line.visual_row_id <= 2
-    ):
-        return False
+    for source, row, target in moves:
+        lanes[source].lines.remove(row)
+        lanes[target].lines.append(row)
+        lanes[target].lines.sort(key=lambda item: (item[1][1], item[1][0], item[0].source_index))
     return True
-
-
-def _reattach_cross_lane_short_tails(
-    lanes: list[_TextLane],
-    median_height: float,
-) -> None:
-    """按前序依赖顺序，把具有唯一栏归属的正文短尾迁回对应栏。"""
-
-    # 栏边界固定，且匹配只依赖 y0 严格更小的行；先确定上方行后，每行至多迁移一次。
-    # 保留原始对象及其来源栏，不能用 source_index 合并或跳过不同的文本行。
-    pending = [(lane, candidate) for lane in lanes for candidate in lane.lines if candidate[0].semantic_type is None]
-    pending.sort(key=lambda item: (item[1][1][1], item[1][1][0], item[1][0].source_index))
-    for source_lane, candidate in pending:
-        # 当前栏也必须参与唯一性判断；多个栏均能接纳时保留原位，避免双向迁移。
-        matches = [lane for lane in lanes if _lane_accepts_short_tail(candidate, lane, median_height)]
-        if len(matches) != 1 or matches[0] is source_lane:
-            continue
-        target_lane = matches[0]
-        source_lane.lines.remove(candidate)
-        target_lane.lines.append(candidate)
-        target_lane.lines.sort(
-            key=lambda item: (item[1][1], item[1][0], item[0].source_index),
-        )
 
 
 def _reattach_repeated_indented_span_tails(
@@ -803,43 +746,23 @@ def _reattach_repeated_indented_span_tails(
 
 
 def _estimate_lane_gap(lane: _TextLane) -> tuple[float, float]:
-    """从栏带内兼容相邻行的较小间隙簇估计常规净空和 MAD。"""
+    """仅为本次行距估计提取一次行高，排序仍作用于原栏带成员列表。"""
+    from ...._compute_backend import get_native
 
+    native = get_native()
     lane.lines.sort(key=lambda item: (item[1][1], item[1][0], item[0].source_index))
-    heights = [_line_effective_height(line, bbox) for line, bbox in lane.lines]
-    median_height = statistics.median(heights) if heights else 1.0
-    gaps: list[float] = []
-    for previous, current in zip(lane.lines, lane.lines[1:]):
-        previous_line, previous_bbox = previous
-        current_line, current_bbox = current
-        if previous_line.visual_row_id == current_line.visual_row_id and (
-            previous_line.split_from_row or current_line.split_from_row
-        ):
-            continue
-        previous_height = _line_effective_height(previous_line, previous_bbox)
-        current_height = _line_effective_height(current_line, current_bbox)
-        if max(previous_height, current_height) / min(previous_height, current_height) > 1.35:
-            continue
-        pair_height = max(previous_height, current_height)
-        gap = _effective_text_row_gap(previous, current)
-        if gap < -0.25 * pair_height or gap > 2.0 * pair_height:
-            continue
-        if (
-            _bbox_axis_overlap_ratio(previous_bbox, current_bbox, axis="x") < 0.5
-            and abs(previous_bbox[0] - current_bbox[0]) > 1.5 * median_height
-        ):
-            continue
-        # PDF 字符框常在相邻基线间产生极小重叠；按零净空计入常规行距统计。
-        gaps.append(max(0.0, gap))
-
-    if not gaps:
-        return 0.35 * median_height, 0.0
-    sorted_gaps = sorted(gaps)
-    lower_count = max(1, math.ceil(len(sorted_gaps) * 0.6))
-    lower_gaps = sorted_gaps[:lower_count]
-    regular_gap = statistics.median(lower_gaps)
-    gap_mad = statistics.median(abs(gap - regular_gap) for gap in lower_gaps)
-    return regular_gap, gap_mad
+    result = native.lane_gap(
+        [bbox for _line, bbox in lane.lines],
+        [_line_effective_height(line, bbox) for line, bbox in lane.lines],
+        [line.restored_inline_cluster for line, _bbox in lane.lines],
+        [
+            previous[0].visual_row_id == current[0].visual_row_id and (previous[0].split_from_row or current[0].split_from_row)
+            for previous, current in zip(lane.lines, lane.lines[1:])
+        ],
+    )
+    if result is None:
+        raise ValueError("native lane gap rejected normalized geometry")
+    return result
 
 
 def _is_structural_typography_gap(
@@ -894,6 +817,21 @@ def _should_connect_text_rows(
         abs(current_bbox[0] - lane.left) <= 0.75 * pair_height
         and -0.5 * pair_height <= previous_bbox[0] - lane.left <= 2.0 * pair_height
     )
+    before_cjk, after_cjk = previous_line.native_cjk_style, current_line.native_cjk_style
+    mixed_cjk_continuation = (
+        before_cjk is not None
+        and after_cjk is not None
+        and before_cjk[:3] == after_cjk[:3]
+        and before_cjk[3] > 0
+        and 0.9 <= after_cjk[3] / before_cjk[3] <= 1.1
+        and 1.25 <= max(previous_height, current_height) / min(previous_height, current_height) <= 1.45
+        and previous_width >= 0.8 * lane_width
+        and current_width >= 0.5 * lane_width
+        and current_returns_to_lane_left
+        and not previous_line.paragraph_terminal
+        and not _font_weights_conflict(previous_line, current_line)
+        and -0.25 * pair_height <= vertical_gap <= regular_gap + 0.35 * pair_height
+    )
     reliable_font_match = (
         previous_line.font_signature is None
         or current_line.font_signature is None
@@ -907,18 +845,59 @@ def _should_connect_text_rows(
         or (current_width <= 0.5 * lane_width and previous_line.font_signature[1] == current_line.font_signature[1])
     )
     previous_indent = previous_bbox[0] - lane.left
+    # 极端字体矩阵校正后，旧字框高度不再夸大缩进；真实同行左缘与常规基线间距仍约束续行。
+    local_metric_pair = all(
+        line.style_scale_repaired
+        and line.source_bbox is not None
+        and line.source_bbox[3] - line.source_bbox[1] >= 4 * _line_effective_height(line, bbox)
+        for line, bbox in (previous, current)
+    )
     repeated_indent_continuation = (
-        previous_indent >= max(5.0, 1.8 * pair_height)
+        previous_indent >= max(5.0, (1.25 if local_metric_pair else 1.8) * pair_height)
         and abs(current_bbox[0] - previous_bbox[0]) <= 0.5 * pair_height
         and reliable_font_match
         and -0.25 * pair_height <= vertical_gap <= regular_gap + max(0.75 * pair_height, 3.0 * gap_mad)
+    )
+    # 逗号未终止的满行正文可接同字体家族的粗体枚举短尾；真实标题、留白和字号变化仍拒绝。
+    emphasized_enumeration_tail = (
+        previous_line.semantic_type is None
+        and current_line.semantic_type is None
+        and previous_line.text.rstrip().endswith((",", "，"))
+        and (current_line.paragraph_terminal or bool(re.search(r"[.!?。！？]$", current_line.text.rstrip())))
+        and len(current_line.text.split()) <= 10
+        and previous_line.font_signature is not None
+        and current_line.font_signature is not None
+        and _font_signatures_share_emphasis_family(previous_line.font_signature, current_line.font_signature)
+        and max(previous_height, current_height) <= 1.2 * min(previous_height, current_height)
+        and -0.1 * pair_height <= vertical_gap <= 0.4 * pair_height
+    )
+    # 未收句的满栏正文后，连词或小写词开头的短斜体收句仍是正文续行；独立大写标签和公式不适用。
+    italic_sentence_tail = (
+        previous_line.semantic_type is None
+        and current_line.semantic_type is None
+        and not previous_line.paragraph_terminal
+        and re.search(r"[.!?。！？:：;；]$", previous_line.text.rstrip()) is None
+        and not previous_line.formula_candidate_only
+        and not current_line.formula_candidate_only
+        and not current_line.compact_formula_cluster
+        and (current_line.paragraph_terminal or bool(re.search(r"[.!?。！？]$", current_line.text.rstrip())))
+        and re.match(r"(?:[+&]\s+|[a-z])", current_line.text.strip()) is not None
+        and 1 <= len(re.findall(r"[A-Za-z]{2,}", current_line.text)) <= 10
+        and previous_line.font_signature is not None
+        and current_line.font_signature is not None
+        and current_line.font_signature[1] & PDF_FONT_ITALIC_FLAG
+        and not previous_line.font_signature[1] & PDF_FONT_ITALIC_FLAG
+        and _font_signatures_share_emphasis_family(previous_line.font_signature, current_line.font_signature)
+        and not _font_weights_conflict(previous_line, current_line)
+        and max(previous_height, current_height) <= 1.2 * min(previous_height, current_height)
+        and -0.1 * pair_height <= vertical_gap <= 0.4 * pair_height
     )
     safe_short_tail = (
         previous_width >= 0.75 * lane_width
         and current_width <= 0.7 * lane_width
         and (aligned_left_edges or current_returns_to_lane_left)
-        and reliable_font_match
-        and not _font_weights_conflict(previous_line, current_line)
+        and (reliable_font_match or emphasized_enumeration_tail or italic_sentence_tail)
+        and (not _font_weights_conflict(previous_line, current_line) or emphasized_enumeration_tail)
         and -0.25 * pair_height <= vertical_gap <= regular_gap + max(0.75 * pair_height, 3.0 * gap_mad)
     )
     height_ratio = max(previous_height, current_height) / min(previous_height, current_height)
@@ -959,7 +938,13 @@ def _should_connect_text_rows(
         and not _font_weights_conflict(previous_line, current_line)
         and -0.25 * pair_height <= vertical_gap <= regular_gap + max(0.35 * pair_height, 3.0 * gap_mad)
     )
-    if font_style_changed and _font_weights_conflict(previous_line, current_line) and not fallback_font_continuation:
+    if (
+        font_style_changed
+        and _font_weights_conflict(previous_line, current_line)
+        and not fallback_font_continuation
+        and not mixed_cjk_continuation
+        and not emphasized_enumeration_tail
+    ):
         # 显式样式位与显著字重同时变化仍是硬边界，不能被满栏几何放宽。
         return False
     if (
@@ -975,7 +960,8 @@ def _should_connect_text_rows(
         and not fallback_font_continuation
     ):
         # 图注到正文等排版层级转换即使同栏满行，也不能被常规续行规则重新吸收。
-        return False
+        if not mixed_cjk_continuation:
+            return False
     full_width_continuation = (
         both_fill_lane
         and aligned_left_edges
@@ -984,7 +970,7 @@ def _should_connect_text_rows(
     )
     if height_ratio > 1.35 and not safe_short_tail and not full_width_continuation:
         # 满栏混合字体可跨字号续接，但显式正体/斜体等样式边界仍保持原分段语义。
-        if not both_fill_lane or not aligned_left_edges or font_style_changed:
+        if (not both_fill_lane or not aligned_left_edges or font_style_changed) and not mixed_cjk_continuation:
             return False
 
     if vertical_gap < -0.25 * pair_height:
@@ -999,6 +985,9 @@ def _should_connect_text_rows(
         return False
     if _horizontal_rule_separates_rows(previous_bbox, current_bbox, lane, axis_lines):
         return False
+    if mixed_cjk_continuation:
+        # 同汉字字形尺度证明日期/英文缩写首行的 dominant font 变化不构成段界，首行缩进仍保留。
+        return True
 
     gap_limit = max(
         regular_gap + max(0.5 * pair_height, 3.0 * gap_mad),

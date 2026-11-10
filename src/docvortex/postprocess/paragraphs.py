@@ -1,12 +1,16 @@
 """PDF 段落延续关系的 raw model-list 后处理。"""
 
 import math
+import re
+from statistics import median
 from typing import Any, TypeAlias
 
 from ..content.spans import inline_span_plain_text
 from ..schema import MERGE_TRANSPARENT_BLOCK_TYPES, BlockType
 
-LINE_STOP_FLAG = (".", "!", "?", "。", "！", "？", ")", "）", '"', "”", ":", "：", ";", "；")
+# 可信缩进与续排几何只放宽普通句末符，括号、引号、冒号和分号继续作为边界。
+SENTENCE_END_FLAGS = (".", "!", "?", "。", "！", "？")
+LINE_STOP_FLAG = (*SENTENCE_END_FLAGS, ")", "）", '"', "”", ":", "：", ";", "；")
 SECTION_MERGE_BARRIER_TYPES = {
     BlockType.DOC_TITLE,
     BlockType.PARAGRAPH_TITLE,
@@ -38,6 +42,7 @@ OrderedBlock: TypeAlias = tuple[int, int, BlockDict]
 def merge_para_text_blocks(pages: list[dict[str, Any]]) -> None:
     """按页面阅读顺序给可延续的文本或参考文献列表写入 continues_prev 标记。"""
     ordered_blocks: list[OrderedBlock] = []
+    page_has_indented_body_paragraph: dict[int, bool] = {}
     for page_info in pages:
         blocks = page_info.get("blocks")
         if not isinstance(blocks, list):
@@ -52,10 +57,15 @@ def merge_para_text_blocks(pages: list[dict[str, Any]]) -> None:
         page_idx = page_info.get("page_idx")
         if not isinstance(page_idx, int):
             continue
+        # 在倒序合并和清理行框之前固定整页证据，不依赖邻页或当前阅读游标。
+        page_has_indented_body_paragraph[page_idx] = any(
+            _is_indented_body_paragraph(block) for block in blocks if isinstance(block, dict)
+        )
         for order_idx, block in enumerate(blocks):
             if isinstance(block, dict):
                 ordered_blocks.append((page_idx, order_idx, block))
 
+    roots = {(page_idx, order_idx): block for page_idx, order_idx, block in ordered_blocks}
     for current_index in range(len(ordered_blocks) - 1, -1, -1):
         current_page_idx, _, current_block = ordered_blocks[current_index]
         current_type = current_block.get("type")
@@ -74,16 +84,35 @@ def merge_para_text_blocks(pages: list[dict[str, Any]]) -> None:
             )
             if previous_block is None:
                 continue
-            previous_page_idx, _, previous_text_block = previous_block
+            previous_page_idx, previous_order_idx, previous_text_block = previous_block
+            if "_pdf_structure" in previous_text_block:
+                continue
             if not _is_same_or_consecutive_page(current_page_idx, previous_page_idx):
                 continue
-            if current_block.get("_reference_start") is False and previous_text_block.get("_reference_start") is not None:
+            # 列表末项必须经过完整正文判据，不能由参考条目侧车绕过句末或几何屏障。
+            previous_is_list_tail = roots[(previous_page_idx, previous_order_idx)].get("type") == BlockType.LIST
+            if (
+                not previous_is_list_tail
+                and current_block.get("_reference_start") is False
+                and previous_text_block.get("_reference_start") is not None
+            ):
                 current_block["continues_prev"] = True
                 continue
-            can_merge = (
-                can_auto_merge_ref_text_blocks(current_block, previous_text_block)
-                if is_ref_text
-                else can_auto_merge_text_blocks(current_block, previous_text_block)
+            allow_layout_continuation = (
+                not is_ref_text
+                and not previous_is_list_tail
+                and current_block.get("_reference_start") is None
+                and previous_text_block.get("_reference_start") is None
+                and page_has_indented_body_paragraph[current_page_idx]
+                and (current_page_idx != previous_page_idx or _is_forward_column_wrap(current_block, previous_text_block))
+            )
+            can_merge = _can_auto_merge_continuable_text_blocks(
+                current_block,
+                previous_text_block,
+                require_current_leading_edge=not is_ref_text,
+                reject_digit_start=not is_ref_text,
+                reject_uppercase_start=not is_ref_text,
+                allow_layout_continuation=allow_layout_continuation,
             )
             if can_merge or _can_auto_merge_multiline_to_single_line(
                 current_block,
@@ -93,7 +122,9 @@ def merge_para_text_blocks(pages: list[dict[str, Any]]) -> None:
                 current_page_idx=current_page_idx,
                 current_type=current_type,
                 require_current_leading_edge=not is_ref_text,
-                reject_digit_or_uppercase_start=not is_ref_text,
+                reject_digit_start=not is_ref_text,
+                reject_uppercase_start=not is_ref_text,
+                allow_layout_continuation=allow_layout_continuation,
             ):
                 current_block["continues_prev"] = True
         elif current_type == BlockType.LIST:
@@ -123,7 +154,8 @@ def can_auto_merge_text_blocks(current_block: BlockDict, previous_block: BlockDi
         current_block,
         previous_block,
         require_current_leading_edge=True,
-        reject_digit_or_uppercase_start=True,
+        reject_digit_start=True,
+        reject_uppercase_start=True,
     )
 
 
@@ -133,7 +165,8 @@ def can_auto_merge_ref_text_blocks(current_block: BlockDict, previous_block: Blo
         current_block,
         previous_block,
         require_current_leading_edge=False,
-        reject_digit_or_uppercase_start=False,
+        reject_digit_start=False,
+        reject_uppercase_start=False,
     )
 
 
@@ -142,7 +175,9 @@ def _can_auto_merge_continuable_text_blocks(
     previous_block: BlockDict,
     *,
     require_current_leading_edge: bool,
-    reject_digit_or_uppercase_start: bool,
+    reject_digit_start: bool,
+    reject_uppercase_start: bool,
+    allow_layout_continuation: bool = False,
 ) -> bool:
     """复用正文与参考文献的公共文本边界、方向及几何续接规则。"""
     current_metric_lines = _metric_line_bboxes(current_block)
@@ -159,16 +194,20 @@ def _can_auto_merge_continuable_text_blocks(
     previous_content = _normalized_text_content(previous_block)
     if not current_content or not previous_content:
         return False
-    if not _has_mergeable_text_boundary(
-        current_content,
-        previous_content,
-        reject_digit_or_uppercase_start=reject_digit_or_uppercase_start,
-    ):
-        return False
 
     current_is_vertical = _is_vertical_text_block_by_lines(current_metric_lines)
     previous_is_vertical = _is_vertical_text_block_by_lines(previous_metric_lines)
     if current_is_vertical != previous_is_vertical:
+        return False
+    # 多行正文由自身行框确认首行贴左；单行的大写与句末放宽均交给后续行参照分支。
+    relax_text_boundary = allow_layout_continuation and not current_is_vertical and len(current_metric_lines) > 1
+    if not _has_mergeable_text_boundary(
+        current_content,
+        previous_content,
+        reject_digit_start=reject_digit_start,
+        reject_uppercase_start=reject_uppercase_start and not relax_text_boundary,
+        allow_sentence_end=relax_text_boundary,
+    ):
         return False
     if current_is_vertical:
         return _can_auto_merge_vertical_text_blocks(
@@ -199,6 +238,12 @@ def _find_previous_text_block(
     for previous_index in range(current_index - 1, -1, -1):
         previous_block = ordered_blocks[previous_index][2]
         previous_type = previous_block.get("type")
+        if previous_type == BlockType.LIST:
+            tail = _direct_text_list_tail(previous_block)
+            if tail is None or _starts_list_item(_normalized_text_content(ordered_blocks[current_index][2])):
+                return None
+            page_idx, order_idx, _ = ordered_blocks[previous_index]
+            return page_idx, order_idx, tail
         if previous_type in TEXT_MERGE_BARRIER_TYPES:
             return None
         if previous_type != BlockType.TEXT:
@@ -207,6 +252,27 @@ def _find_previous_text_block(
             continue
         return ordered_blocks[previous_index]
     return None
+
+
+def _direct_text_list_tail(block: BlockDict) -> BlockDict | None:
+    """仅把正文列表的最后一个直属 text 成员作为候选，不穿透参考文献或嵌套列表。"""
+    content = block.get("content")
+    if block.get("sub_type") != BlockType.TEXT or not isinstance(content, list) or not content:
+        return None
+    tail = content[-1]
+    return tail if isinstance(tail, dict) and tail.get("type") == BlockType.TEXT else None
+
+
+def _starts_list_item(text: str) -> bool:
+    """新编号或项目符号表示新条目，不能作为上一列表末项的无编号续文。"""
+    return (
+        re.match(
+            r"^(?:[-*+•●○▪▫◦‣⁃–—](?:\s|$)|[（(]?(?:\d+|[A-Za-z]|[IVXLCDMivxlcdm]+)[.．、)）]|"
+            r"[\[［]\d+[\]］]|[一二三四五六七八九十百]+[、.．)）]|[①-⑳])",
+            text,
+        )
+        is not None
+    )
 
 
 def _find_previous_ref_text_block(
@@ -332,19 +398,49 @@ def _is_vertical_text_block_by_lines(line_bboxes: list[CalculationBBox]) -> bool
     return vertical_line_count / len(line_bboxes) > VERTICAL_LINE_IN_BLOCK_THRESHOLD
 
 
+def _is_indented_body_paragraph(block: BlockDict) -> bool:
+    """用横排正文首行右移及后续行回落证明缩进，排除条目、居中、悬挂和整块偏移。"""
+    if block.get("type") != BlockType.TEXT or block.get("_reference_start") is not None:
+        return False
+    content = _normalized_text_content(block)
+    if not content or _starts_list_item(content) or _bbox_for_calculation(block.get("bbox")) is None:
+        return False
+    lines = _metric_line_bboxes(block)
+    if len(lines) < 2 or _is_vertical_text_block_by_lines(lines):
+        return False
+    body_left = min(line[0] for line in lines[1:])
+    # 首行同时向内收缩左右两端更像居中短标签；复用现有行尾贴边门槛排除该类证据。
+    if max(line[2] for line in lines) - lines[0][2] >= _line_height(lines[0]):
+        return False
+    return lines[0][0] - body_left >= _line_height(lines[0]) / 2 and all(
+        abs(line[0] - body_left) < _line_height(line) / 2 for line in lines[1:]
+    )
+
+
+def _is_forward_column_wrap(current_block: BlockDict, previous_block: BlockDict) -> bool:
+    """版面证据放宽仅用于向右跨栏且首行回到前段末行上方，避免同栏重叠与并排标签误接。"""
+    current_lines = _metric_line_bboxes(current_block)
+    previous_lines = _metric_line_bboxes(previous_block)
+    if not current_lines or not previous_lines:
+        return False
+    return _bbox_union(current_lines)[0] >= _bbox_union(previous_lines)[2] and current_lines[0][3] < previous_lines[-1][1]
+
+
 def _has_mergeable_text_boundary(
     current_content: str,
     previous_content: str,
     *,
-    reject_digit_or_uppercase_start: bool,
+    reject_digit_start: bool,
+    reject_uppercase_start: bool,
+    allow_sentence_end: bool = False,
 ) -> bool:
-    """使用前块结尾和后块开头字符排除明显的新段落边界。"""
-    if previous_content.endswith(LINE_STOP_FLAG):
+    """检查文本首尾边界，仅在续排版面证据成立时放宽前块的普通句末符。"""
+    if previous_content.endswith(LINE_STOP_FLAG) and not (allow_sentence_end and previous_content.endswith(SENTENCE_END_FLAGS)):
         return False
-    if not reject_digit_or_uppercase_start:
-        return True
     first_char = current_content[0]
-    return not first_char.isdigit() and not first_char.isupper()
+    if reject_digit_start and first_char.isdigit():
+        return False
+    return not (reject_uppercase_start and first_char.isupper())
 
 
 def _collect_following_same_orientation_lines(
@@ -432,7 +528,9 @@ def _can_auto_merge_multiline_to_single_line(
     current_page_idx: int,
     current_type: str,
     require_current_leading_edge: bool,
-    reject_digit_or_uppercase_start: bool,
+    reject_digit_start: bool,
+    reject_uppercase_start: bool,
+    allow_layout_continuation: bool = False,
 ) -> bool:
     """用后续五行或列补足单行主轴尺寸，再复用原横排或竖排连接规则。"""
     current_lines = _metric_line_bboxes(current_block)
@@ -464,10 +562,18 @@ def _can_auto_merge_multiline_to_single_line(
     previous_content = _normalized_text_content(previous_block)
     if current_bbox is None or previous_bbox is None or not current_content or not previous_content:
         return False
+    # 单行的大写与句末放宽都要求当前页至少三条同栏后续行独立证明贴左。
+    relax_text_boundary = (
+        allow_layout_continuation
+        and not current_is_vertical
+        and abs(current_lines[0][0] - median(line[0] for line in aligned_lines)) < _line_height(current_lines[0]) / 2
+    )
     if not _has_mergeable_text_boundary(
         current_content,
         previous_content,
-        reject_digit_or_uppercase_start=reject_digit_or_uppercase_start,
+        reject_digit_start=reject_digit_start,
+        reject_uppercase_start=reject_uppercase_start and not relax_text_boundary,
+        allow_sentence_end=relax_text_boundary,
     ):
         return False
 

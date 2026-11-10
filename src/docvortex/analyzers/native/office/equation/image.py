@@ -10,7 +10,7 @@ import struct
 from loguru import logger
 
 from ..errors import LegacyOfficeResourceLimitError
-from ..limits import MAX_ASSET_TOTAL_BYTES, MAX_ENTRY_BYTES, MAX_PICTURE_RECORDS
+from ..limits import MAX_ENTRY_BYTES, MAX_EQUATION_CANDIDATE_TOTAL_BYTES, MAX_PICTURE_RECORDS, MAX_RECORDS
 from .mtef import decode_mtef
 
 _PLACEABLE_WMF_MAGIC = b"\xd7\xcd\xc6\x9a"
@@ -271,33 +271,46 @@ def _wmf_mtef_candidates(image_data: bytes) -> tuple[list[bytes], bool]:
 def _gif_subblocks(
     image_data: bytes,
     cursor: int,
-    counter: list[int],
-) -> tuple[bytes, int]:
-    """读取以零长度块终止的 GIF sub-block 序列。"""
+    *,
+    collect_payload: bool,
+    subblock_counter: list[int],
+    candidate_bytes_remaining: int | None = None,
+) -> tuple[bytes | None, int]:
+    """读取 GIF sub-block 序列；仅对已识别的公式扩展保留 payload。"""
 
     chunks: list[bytes] = []
     total = 0
     while True:
-        _charge_picture_record(counter)
+        subblock_counter[0] += 1
+        if subblock_counter[0] > MAX_RECORDS:
+            raise LegacyOfficeResourceLimitError(f"GIF sub-block count exceeds max_records={MAX_RECORDS}")
         if cursor >= len(image_data):
             raise _ImageEquationError("GIF sub-block length is truncated")
         size = image_data[cursor]
         cursor += 1
         if size == 0:
-            return b"".join(chunks), cursor
+            return b"".join(chunks) if collect_payload else None, cursor
         end = cursor + size
         if end < cursor or end > len(image_data):
             raise _ImageEquationError("GIF sub-block data is truncated")
-        total += size
-        if total > MAX_ENTRY_BYTES:
-            raise LegacyOfficeResourceLimitError(f"GIF extension exceeds max_entry_bytes={MAX_ENTRY_BYTES}")
-        chunks.append(image_data[cursor:end])
+        if collect_payload:
+            # 普通帧只遍历结构；公式载荷在复制、拼接前检查单候选和剩余累计预算。
+            total += size
+            if total > MAX_ENTRY_BYTES:
+                raise LegacyOfficeResourceLimitError(f"GIF sub-block payload exceeds max_entry_bytes={MAX_ENTRY_BYTES}")
+            if candidate_bytes_remaining is not None and total > candidate_bytes_remaining:
+                raise LegacyOfficeResourceLimitError(
+                    f"image equation candidates exceed max_equation_candidate_total_bytes={MAX_EQUATION_CANDIDATE_TOTAL_BYTES}"
+                )
+            chunks.append(image_data[cursor:end])
         cursor = end
 
 
-def _gif_mtef_candidates(image_data: bytes) -> tuple[list[bytes], bool]:
-    """完整遍历 GIF blocks 并提取 MathType/001 Application Extension。"""
+def _gif_mtef_candidates(image_data: bytes, *, candidate_bytes_remaining: int | None = None) -> tuple[list[bytes], bool]:
+    """完整遍历 GIF 结构，并在剩余累计预算内提取 MathType/001 载荷。"""
 
+    if candidate_bytes_remaining is None:
+        candidate_bytes_remaining = MAX_EQUATION_CANDIDATE_TOTAL_BYTES
     if len(image_data) < 13 or image_data[:6] not in _GIF_HEADERS:
         return [], False
     packed = image_data[10]
@@ -310,6 +323,7 @@ def _gif_mtef_candidates(image_data: bytes) -> tuple[list[bytes], bool]:
     candidates: list[bytes] = []
     recognized = False
     counter = [0]
+    subblock_counter = [0]
     saw_trailer = False
     while cursor < len(image_data):
         _charge_picture_record(counter)
@@ -328,7 +342,12 @@ def _gif_mtef_candidates(image_data: bytes) -> tuple[list[bytes], bool]:
             if cursor >= len(image_data):
                 raise _ImageEquationError("GIF image data is truncated")
             cursor += 1  # LZW minimum code size
-            _image_payload, cursor = _gif_subblocks(image_data, cursor, counter)
+            _image_payload, cursor = _gif_subblocks(
+                image_data,
+                cursor,
+                collect_payload=False,
+                subblock_counter=subblock_counter,
+            )
             continue
         if marker != 0x21:
             raise _ImageEquationError("GIF block marker is invalid")
@@ -337,7 +356,12 @@ def _gif_mtef_candidates(image_data: bytes) -> tuple[list[bytes], bool]:
         extension_label = image_data[cursor]
         cursor += 1
         if extension_label != 0xFF:
-            _payload, cursor = _gif_subblocks(image_data, cursor, counter)
+            _payload, cursor = _gif_subblocks(
+                image_data,
+                cursor,
+                collect_payload=False,
+                subblock_counter=subblock_counter,
+            )
             continue
         if cursor >= len(image_data):
             raise _ImageEquationError("GIF application block size is truncated")
@@ -348,14 +372,28 @@ def _gif_mtef_candidates(image_data: bytes) -> tuple[list[bytes], bool]:
             raise _ImageEquationError("GIF application identifier is truncated")
         application = image_data[cursor:application_end]
         cursor = application_end
-        payload, cursor = _gif_subblocks(image_data, cursor, counter)
         if application_size != 11:
+            _payload, cursor = _gif_subblocks(
+                image_data,
+                cursor,
+                collect_payload=False,
+                subblock_counter=subblock_counter,
+            )
             continue
         application_id = application[:8]
         authentication = application[8:11]
-        if application_id == b"MathType" and authentication == b"001":
+        is_mathtype = application_id == b"MathType" and authentication == b"001"
+        payload, cursor = _gif_subblocks(
+            image_data,
+            cursor,
+            collect_payload=is_mathtype,
+            subblock_counter=subblock_counter,
+            candidate_bytes_remaining=candidate_bytes_remaining,
+        )
+        if is_mathtype and payload is not None:
             recognized = True
             candidates.append(payload)
+            candidate_bytes_remaining -= len(payload)
         # MathType/002 是 baseline，必须明确忽略。
 
     if not saw_trailer:
@@ -398,6 +436,14 @@ def _format_hint(
     return None
 
 
+@dataclass(frozen=True, slots=True)
+class OfficeImageProbe:
+    """图片探测结果；超限状态必须阻止原图继续渲染。"""
+
+    latex: str | None = None
+    limit_reason: str | None = None
+
+
 @dataclass(slots=True)
 class OfficeImageEquationDecoder:
     """按共享资源上限缓存并解码 WMF/GIF 图片中的 MTEF。"""
@@ -405,6 +451,47 @@ class OfficeImageEquationDecoder:
     total_bytes: int = 0
     _cache: dict[tuple[str, bytes], str | None] = field(default_factory=dict)
     _warned: set[tuple[str, bytes]] = field(default_factory=set)
+    _probes: dict[tuple[str, bytes], OfficeImageProbe] = field(default_factory=dict)
+
+    def check_limit(self, image_data: bytes, part_name: str, content_type: str) -> str | None:
+        """向通用图片预算提供检查回调，避免二进制层反向依赖公式实现。"""
+        return self.probe(image_data, part_name=part_name, content_type=content_type).limit_reason
+
+    def probe(
+        self,
+        image_data: object | None,
+        *,
+        part_name: object | None = None,
+        content_type: str | None = None,
+    ) -> OfficeImageProbe:
+        """在单张图片边界隔离资源错误，缓存拒绝结果且不保留原始载荷。"""
+        if not isinstance(image_data, bytes):
+            return OfficeImageProbe()
+        image_format = _format_hint(image_data, part_name, content_type)
+        if image_format is None:
+            return OfficeImageProbe()
+        digest = hashlib.sha256(image_data).digest()
+        key = (image_format, digest)
+        if key not in self._probes:
+            try:
+                result = OfficeImageProbe(self.decode(image_data, part_name=part_name, content_type=content_type))
+            except LegacyOfficeResourceLimitError as exc:
+                result = OfficeImageProbe(limit_reason=str(exc))
+                logger.warning(
+                    "OFFICE_IMAGE_LIMIT: part={!r}, format={}, payload_sha256={}: {}. Using placeholder.",
+                    str(part_name or ""),
+                    image_format,
+                    digest.hex()[:16],
+                    exc,
+                )
+            self._probes[key] = result
+        return self._probes[key]
+
+    @property
+    def candidate_total_bytes(self) -> int:
+        """返回已计入预算的公式 candidate 总字节数。"""
+
+        return self.total_bytes
 
     def decode(
         self,
@@ -420,24 +507,27 @@ class OfficeImageEquationDecoder:
         image_format = _format_hint(image_data, part_name, content_type)
         if image_format is None:
             return None
-        if len(image_data) > MAX_ENTRY_BYTES:
-            raise LegacyOfficeResourceLimitError(f"image equation payload exceeds max_entry_bytes={MAX_ENTRY_BYTES}")
+        if image_format == "wmf" and len(image_data) > MAX_ENTRY_BYTES:
+            raise LegacyOfficeResourceLimitError(f"office image exceeds max_entry_bytes={MAX_ENTRY_BYTES}")
         digest = hashlib.sha256(image_data).digest()
         cache_key = (image_format, digest)
         if cache_key in self._cache:
             return self._cache[cache_key]
-        if self.total_bytes + len(image_data) > MAX_ASSET_TOTAL_BYTES:
-            raise LegacyOfficeResourceLimitError(
-                f"image equation payloads exceed max_asset_total_bytes={MAX_ASSET_TOTAL_BYTES}"
-            )
-        self.total_bytes += len(image_data)
-
         recognized = False
         try:
             if image_format == "wmf":
                 candidates, recognized = _wmf_mtef_candidates(image_data)
             else:
-                candidates, recognized = _gif_mtef_candidates(image_data)
+                candidates, recognized = _gif_mtef_candidates(
+                    image_data,
+                    candidate_bytes_remaining=MAX_EQUATION_CANDIDATE_TOTAL_BYTES - self.total_bytes,
+                )
+            candidate_bytes = sum(len(candidate) for candidate in candidates)
+            if self.total_bytes + candidate_bytes > MAX_EQUATION_CANDIDATE_TOTAL_BYTES:
+                raise LegacyOfficeResourceLimitError(
+                    f"image equation candidates exceed max_equation_candidate_total_bytes={MAX_EQUATION_CANDIDATE_TOTAL_BYTES}"
+                )
+            self.total_bytes += candidate_bytes
             latex = _select_candidate_latex(candidates)
         except LegacyOfficeResourceLimitError:
             raise

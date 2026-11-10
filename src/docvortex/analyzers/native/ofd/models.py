@@ -82,6 +82,12 @@ class TextLine:
     template_id: int | None
     styles: tuple[str, ...] = ()
     runs: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # 仅确认单行时保留源对象布局范围；组行可合并该范围，公开 bbox 仍使用字形框。
+    source_bbox: BBox | None = None
+    # 私有 XML 来源：(父容器展开实例、首子节点序号、末子节点序号)，不以对象 ID 或绘制序号推断邻接。
+    source_order: tuple[int, int, int] | None = None
+    # 私有单行证据来自裁剪前实际展开的纵向步进；None 表示构建器未提供证明。
+    has_nonzero_delta_y: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -6,11 +6,11 @@ import re
 
 from .....schema import BBox
 from ..geometry import _bbox_axis_overlap_ratio, _bbox_center_x, _bbox_center_y
-from ..line_layout import _effective_text_row_gap
+from ..line_layout import _line_effective_height
 from ..models import _LineItem
 
 _NUMBERED_SECTION_TITLE_RE = re.compile(
-    r"^(?P<number>\d+(?:\s*\.\s*\d+)*)\s+(?P<label>\S.*)$",
+    r"^(?P<number>(?:[A-Z]\s*\.\s*)?\d+(?:\s*\.\s*\d+)*)\s+(?P<label>\S.*)$",
 )
 
 
@@ -30,50 +30,25 @@ _UNNUMBERED_SECTION_HEADING_RE = re.compile(
 )
 
 
-def _build_physical_title_gap_map(
-    line_geometry: list[tuple[_LineItem, BBox]],
-) -> dict[int, tuple[float | None, float | None]]:
-    """为每行记录同方向且水平投影相交的最近上、下物理行净空。"""
+def _build_physical_title_gap_map(line_geometry: list[tuple[_LineItem, BBox]]) -> dict[int, tuple[float | None, float | None]]:
+    """将稳定行身份与当前几何一次交给原生内核计算上下物理净空。"""
+    from ....._compute_backend import get_native
 
-    output: dict[int, tuple[float | None, float | None]] = {}
-    for line, bbox in line_geometry:
-        line_center = _bbox_center_y(bbox)
-        above_gaps: list[float] = []
-        below_gaps: list[float] = []
-        for other_line, other_bbox in line_geometry:
-            if other_line is line:
-                continue
-            if _bbox_axis_overlap_ratio(bbox, other_bbox, axis="x") < 0.1:
-                # 双栏同高度正文并非当前行的物理上下文，不能抹掉真实标题留白。
-                continue
-            if line.visual_row_id is not None and other_line.visual_row_id == line.visual_row_id:
-                continue
-            other_center = _bbox_center_y(other_bbox)
-            if other_center < line_center:
-                above_gaps.append(
-                    max(
-                        0.0,
-                        _effective_text_row_gap(
-                            (other_line, other_bbox),
-                            (line, bbox),
-                        ),
-                    )
-                )
-            elif other_center > line_center:
-                below_gaps.append(
-                    max(
-                        0.0,
-                        _effective_text_row_gap(
-                            (line, bbox),
-                            (other_line, other_bbox),
-                        ),
-                    )
-                )
-        output[line.source_index] = (
-            min(above_gaps) if above_gaps else None,
-            min(below_gaps) if below_gaps else None,
+    row_ids = {}
+    records = [
+        (
+            id(line),
+            None if line.visual_row_id is None else row_ids.setdefault(line.visual_row_id, len(row_ids)),
+            box,
+            _line_effective_height(line, box),
+            line.restored_inline_cluster,
         )
-    return output
+        for line, box in line_geometry
+    ]
+    values = get_native().title_gaps(records)
+    if values is None:
+        raise ValueError("native title gap calculation rejected normalized geometry")
+    return {line.source_index: value for (line, _box), value in zip(line_geometry, values, strict=True)}
 
 
 def _line_inside_visual_container(

@@ -59,6 +59,7 @@ FileSuffix: TypeAlias = Literal[
     "tsv",
     "epub",
     "html",
+    "mhtml",
     "ofd",
     "odt",
     "ods",
@@ -507,7 +508,7 @@ class InlineContentBlock(BlockBase):
 
 
 class ContinuableTextBlockBase(InlineContentBlock):
-    """正文与参考文献共享的跨块续接结构。"""
+    """顶层正文或参考续文；正文可接前序正文列表的最后一个直属 text，物理块不移动。"""
 
     continues_prev: bool | None = None
 
@@ -620,24 +621,28 @@ class ImageAnnotationBlock(InlineContentBlock):
     """图片标题与图片脚注的共享结构。"""
 
     type: Literal[BlockType.IMAGE_CAPTION, BlockType.IMAGE_FOOTNOTE]  # type: ignore[reportIncompatibleVariableOverride]
+    anchor: str | None = None
 
 
 class TableAnnotationBlock(InlineContentBlock):
     """表格标题与表格脚注的共享结构。"""
 
     type: Literal[BlockType.TABLE_CAPTION, BlockType.TABLE_FOOTNOTE]  # type: ignore[reportIncompatibleVariableOverride]
+    anchor: str | None = None
 
 
 class ChartAnnotationBlock(InlineContentBlock):
     """图表标题与图表脚注的共享结构。"""
 
     type: Literal[BlockType.CHART_CAPTION, BlockType.CHART_FOOTNOTE]  # type: ignore[reportIncompatibleVariableOverride]
+    anchor: str | None = None
 
 
 class CodeAnnotationBlock(InlineContentBlock):
     """代码标题与代码脚注的共享结构。"""
 
     type: Literal[BlockType.CODE_CAPTION, BlockType.CODE_FOOTNOTE]  # type: ignore[reportIncompatibleVariableOverride]
+    anchor: str | None = None
 
 
 ListChildBlock: TypeAlias = Annotated[

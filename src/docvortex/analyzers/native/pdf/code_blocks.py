@@ -198,13 +198,11 @@ def _vertical_rule_candidate_height_coverage(
     return overlap / candidate_height
 
 
-def _detect_rule_delimited_code_candidates(
-    source: _PageSource,
-    excluded_bboxes: list[BBox],
-    claimed_line_indices: set[int],
-) -> list[_CodeCandidate]:
-    """按规则边界、稳定行距和缩进层次识别非等宽代码清单。"""
+def _detect_rule_delimited_code_candidates(source, excluded_bboxes, claimed_line_indices):
+    """几何窗口整批计算，结构、认领及稳定排序继续逐项使用原有规则。"""
+    from ...._compute_backend import get_native
 
+    native = get_native()
     page_width, page_height = source.page_size
     if page_width <= 0 or page_height <= 0:
         return []
@@ -212,7 +210,7 @@ def _detect_rule_delimited_code_candidates(
     if len(available) < 5:
         return []
     median_height = statistics.median(max(0.1, line.effective_height or line.bbox[3] - line.bbox[1]) for line in available)
-    horizontal_rules = sorted(
+    horizontal = sorted(
         [
             line
             for line in source.drawing_lines
@@ -220,67 +218,19 @@ def _detect_rule_delimited_code_candidates(
         ],
         key=lambda line: (line.bbox[1], line.bbox[0]),
     )
-    vertical_rules = [line for line in source.drawing_lines if line.orientation == "vertical"]
-    raw_candidates: list[_CodeCandidate] = []
-    endpoint_tolerance = max(2.0, 0.75 * median_height)
-    for top_index, top_rule in enumerate(horizontal_rules[:-1]):
-        for bottom_rule in horizontal_rules[top_index + 1 :]:
-            if (
-                abs(top_rule.bbox[0] - bottom_rule.bbox[0]) > endpoint_tolerance
-                or abs(top_rule.bbox[2] - bottom_rule.bbox[2]) > endpoint_tolerance
-            ):
-                continue
-            candidate_bbox = _bbox_union_many([top_rule.bbox, bottom_rule.bbox])
-            candidate_height = candidate_bbox[3] - candidate_bbox[1]
-            if not 6.0 * median_height <= candidate_height <= 0.5 * page_height:
-                continue
-            if any(_bbox_overlap_in_smaller(candidate_bbox, excluded_bbox) >= 0.5 for excluded_bbox in excluded_bboxes):
-                continue
-            interior_rules = [
-                rule
-                for rule in horizontal_rules
-                if top_rule.bbox[3] + 0.5 * median_height < rule.bbox[1] < bottom_rule.bbox[1] - 0.5 * median_height
-                and _bbox_overlap_in_first(rule.bbox, candidate_bbox) >= 0.8
-                and rule.bbox[2] - rule.bbox[0] >= 0.6 * (candidate_bbox[2] - candidate_bbox[0])
-            ]
-            if interior_rules:
-                continue
-            internal_vertical_rules = [
-                rule
-                for rule in vertical_rules
-                if candidate_bbox[0] + median_height < _bbox_center_x(rule.bbox) < candidate_bbox[2] - median_height
-                # 表格竖轨可能贯穿候选上下边界，必须相对候选高度计算覆盖率。
-                and _vertical_rule_candidate_height_coverage(
-                    rule.bbox,
-                    candidate_bbox,
-                )
-                >= 0.6
-            ]
-            if internal_vertical_rules:
-                continue
-            members = [
-                line
-                for line in available
-                if candidate_bbox[0] - 0.5 * median_height
-                <= _bbox_center_x(line.bbox)
-                <= candidate_bbox[2] + 0.5 * median_height
-                and top_rule.bbox[3] <= _bbox_center_y(line.bbox) <= bottom_rule.bbox[1]
-            ]
-            if not _rule_delimited_code_members_are_structured(
-                members,
-                candidate_bbox,
-                median_height,
-            ):
-                continue
-            raw_candidates.append(
-                _CodeCandidate(
-                    bbox=candidate_bbox,
-                    angle=0,
-                    line_indices={line.source_index for line in members},
-                )
-            )
-
-    accepted: list[_CodeCandidate] = []
+    vertical = [line for line in source.drawing_lines if line.orientation == "vertical"]
+    boxes = [line.bbox for line in available]
+    hb, vb = [rule.bbox for rule in horizontal], [rule.bbox for rule in vertical]
+    windows = native.code_rule_windows(hb, vb, boxes, excluded_bboxes, median_height, page_height)
+    if windows is None:
+        raise ValueError("native code window detection rejected normalized geometry")
+    raw_candidates = []
+    for top, bottom, indices in windows:
+        bbox = _bbox_union_many([horizontal[top].bbox, horizontal[bottom].bbox])
+        members = [available[index] for index in indices]
+        if _rule_delimited_code_members_are_structured(members, bbox, median_height):
+            raw_candidates.append(_CodeCandidate(bbox, 0, {line.source_index for line in members}))
+    accepted = []
     for candidate in sorted(raw_candidates, key=lambda item: _bbox_area(item.bbox)):
         if any(_bbox_overlap_in_smaller(candidate.bbox, existing.bbox) >= 0.85 for existing in accepted):
             continue
@@ -344,6 +294,21 @@ def _rule_delimited_code_members_are_structured(
     # 稳定行号槽属于强代码证据，允许右侧长语句或注释自然触及清单边界。
     if has_line_number_gutter:
         return True
+
+    # 缩进和等行距也常见于规范正文；无行号清单还须有程序语法或等宽拉丁排版证据。
+    syntax_rows = sum(
+        bool(
+            re.search(
+                r"(?:\b(?:if|else|while|for|return|def|function|begin|end)\b|:=|->|[{}]|\w+\s*\([^。]+\)\s*[;:])",
+                line.text,
+                re.I,
+            )
+        )
+        for line in members
+    )
+    monospace_ratio, advances = _monospace_character_support(members)
+    if syntax_rows < 2 and not (monospace_ratio >= 0.8 and _monospace_advances_are_stable(advances)):
+        return False
 
     occupied_width = max(line.bbox[2] for line in members) - min(line.bbox[0] for line in members)
     return occupied_width <= 0.95 * max(

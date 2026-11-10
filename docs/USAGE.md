@@ -40,7 +40,7 @@ artifact.write("output/report.docx")
 
 | Stage | Result | Purpose |
 | --- | --- | --- |
-| `analyze(source)` | `AnalysisResult` | Read native content into `model_json` |
+| `analyze(source)` | `AnalysisResult` | Read native document content into `model_json`; report when PDF OCR requires MinerU |
 | `postprocess(analysis)` | `DocumentResult` | Build `middle_json` and materialize assets |
 | `render(middle_json, format, assets=...)` | `RenderArtifact` | Encode an output without writing files |
 | `artifact.write(path)` | `ExportResult` | Write the main file and required sidecar assets |
@@ -196,33 +196,109 @@ have empty `content` and retain their region images (including detected numbers)
 so all renderers use the existing image fallback. Inline equations are unchanged.
 Old results and caches are not rewritten; reparse to obtain the new output.
 
-## Explicit PDF classification
+## Tagged PDF and PDF/UA native parsing
 
-DocVortex parses native document content without OCR or VLM inference.
-For scanned or otherwise unsuitable PDFs, applications can classify the document
-and choose their own OCR or inference service.
+`analyze()`, `parse()`, `convert()` and `PdfModel.predict()` accept
+`pdf_structure="auto"` (default) or `"off"`. Automatic parsing uses the PDF's
+structure tree for supported semantics and reading order, with geometric Flash
+analysis for uncovered or rejected content. The same path accepts ordinary
+Tagged PDF files and PDFs declaring PDF/UA.
+
+```python
+import docvortex
+
+result = docvortex.parse("accessible.pdf", pdf_structure="auto", page_range="1-3")
+geometry_result = docvortex.parse("accessible.pdf", pdf_structure="off")
+```
+
+```bash
+docvortex convert accessible.pdf -o output/accessible.md --pdf-structure auto
+```
+
+The native path covers paragraphs, headings, nested lists, table cells and spans,
+figures, captions, links and formulas. `Title` uses `doc_title`, while `Hn` uses
+`paragraph_title` at `min(n + 1, 6)`. MathML and explicit TeX annotations use the
+existing formula representation. Graphical formulas can use region images.
+
+The versioned `docvortex_pdf_structure` document extension retains source roles,
+heading levels, language, alternate text, attributes and final block paths.
+Diagnostics report rejected references, table spans and reading-order conflicts.
+Page selection reads structure from the original document and preserves original
+page identities. Result bundles carry the semantic output, extension and assets.
+
+`pdf_structure="off"` selects geometric parsing. An explicit `off` value on a
+non-PDF input reports `pdf_structure_invalid`. Code blocks on the structure path
+use declared language information or `txt`.
+
+## PDF classification and OCR requirements
+
+`analyze()`, `parse()` and `convert()` accept `parse_mode="auto"` (default),
+`"txt"` or `"ocr"`. Auto mode first accepts sufficient native structure evidence.
+Otherwise, it classifies the selected pages as a whole after `page_range` has
+been applied. A `txt` classification uses native parsing; an
+`ocr` classification raises `DocumentError` with code `pdf_ocr_unsupported`.
+Forced text mode skips classification. The `ocr` value is retained for
+compatibility and immediately raises the same error for PDF input, without
+classification or analysis. Non-PDF input accepts only the default auto mode;
+invalid modes retain the `parse_mode_invalid` error.
+
+DocVortex does not download models or perform PDF OCR. The error asks you to
+download and install [MinerU](https://github.com/opendatalab/MinerU) and includes
+that project URL. DocVortex does not install or invoke MinerU automatically,
+and existing model caches are left untouched.
+
+If a mixed PDF is classified as `txt` but contains scanned pages, native parsing
+continues for the whole selection. Auto mode does not classify or switch backends
+per page. Use MinerU when those pages need OCR.
+
+```bash
+docvortex convert report.pdf -o output/report.md --pages 1-3
+docvortex convert report.pdf -o output/native.md --parse-mode txt
+```
+
+```python
+import docvortex
+from docvortex.errors import DocumentError
+
+try:
+    result = docvortex.parse("scan.pdf", keep_model_json=True)
+except DocumentError as error:
+    if error.code != "pdf_ocr_unsupported":
+        raise
+    print(error)  # Includes the MinerU download link.
+else:
+    result.export("output/scan.md")
+native = docvortex.parse("report.pdf", parse_mode="txt")
+```
+
+The CLI prints the same message and exits with a nonzero status for OCR requests.
+No conversion output is written, even with `--overwrite`.
+
+Classification remains separately available without inference or networking:
 
 ```bash
 docvortex classify report.pdf
 ```
 
-The command returns `txt` or `ocr`. The equivalent Python operation is explicit:
+The command returns `txt` or `ocr`. A caller can also inspect the classification:
 
 ```python
 import docvortex
 from docvortex.document.pdf import PDFDocument
 
 with PDFDocument("report.pdf") as document:
-    mode = document.classify()
-    if mode == "txt":
-        result = docvortex.parse(document)
-        result.export("output/native.md", output_format="markdown")
+    if document.classify() == "ocr":
+        print("Please download and install MinerU: https://github.com/opendatalab/MinerU")
     else:
-        print("This PDF needs an external OCR or inference workflow.")
+        result = docvortex.parse(document, parse_mode="txt")
+        result.export("output/result.md", output_format="markdown")
 ```
 
-Classification does not start inference. Native analysis does not classify
-automatically or switch to another backend.
+Classification and metadata extraction do not start inference. The low-level
+`docvortex.analyzers.native.PdfModel.predict()` continues to perform only native
+text analysis, preserving explicit callers such as MinerU. Shared helpers that
+process supplied OCR results, such as table text projection, remain available
+and do not perform inference.
 
 ## Page images and embedded assets
 
@@ -247,7 +323,8 @@ print(image.width, image.height, image.mime_type, image.extension)
 - The returned `ImageArtifact` is immutable and remains usable after the document closes. `crop_image()` returns JPEG bytes.
 
 `PDFDocument.from_image()` can wrap an image as a PDF document for low-level
-document operations; it does not add OCR to the native parser.
+document operations. It does not add a text layer or perform OCR. Use MinerU
+to recognize text in scanned pages or images.
 
 Use `docvortex.assets` to validate embedded images or transcode image bytes:
 
@@ -353,3 +430,9 @@ and [HTML protocol](HTML_PROTOCOL.md).
 For cross-package integrations, `docvortex.public_api.PUBLIC_API` lists supported
 modules and symbols. Read the [public SDK and 0.4 migration guide](sdk-0.4.md)
 before upgrading a host application that uses DocVortex internals or older imports.
+
+From 0.5.16, `docvortex.analyzers.pdf.is_generated_cjk_space` exposes the evidence
+check for ignoring generated spaces at Chinese text boundaries. The optional
+`Char.is_generated` field preserves character provenance; the function does not
+modify source records. Hosts using this interface require DocVortex 0.5.16 or
+later. Native protocol 34 requires matching Python source and extension versions.

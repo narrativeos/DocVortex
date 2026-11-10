@@ -1,6 +1,7 @@
-# DocVortex 0.4 公共 SDK 与宿主迁移
+# DocVortex 公共 SDK 与宿主迁移
 
-本文记录 0.4 系列的公共模块边界。MinerU 的共享图片导出需要 `docvortex>=0.4.19,<1`，文档协议、解析路由、模型回退与渲染语义保持不变。
+本文记录自 0.4 系列以来的公共模块边界。MinerU 本次无 OpenCV 模型路径需要 `docvortex>=0.5.12,<1`，
+文档协议、解析路由、模型回退与渲染语义保持不变；各历史版本的新增能力和最低版本见下方记录。
 
 ## 公开入口
 
@@ -9,6 +10,7 @@
 | foundation 几何及 PDF 通用坐标原语 | `docvortex.geometry` |
 | foundation 文本与链接规则 | `docvortex.content.text`、`docvortex.content.links` |
 | 图像统计、素材编码与路径校验 | `docvortex.assets` |
+| 通用图像数值内核 | `docvortex.image`（0.5.12） |
 | PDFDocument、PDFPage、字符和几何契约 | `docvortex.document.pdf` |
 | HTML 来源上下文 | `docvortex.document.contracts.HtmlSourceContext` |
 | 原生文字证据、区域表格及 OCR 文本投影 | `docvortex.analyzers.pdf` |
@@ -17,6 +19,114 @@
 | 推理平台支持判断 | MinerU model/runtime |
 
 `docvortex.public_api.PUBLIC_API` 是静态模块及符号清单。新增跨库依赖必须同时更新清单、文档和契约测试；不能通过基础实现、私有模块或动态别名绕过边界。
+
+### 0.5.17 HTML 单文件图片导出
+
+`docvortex.export.embed_html_images(html, assets)` 将已渲染 HTML 中的正文及富文本图片转为内嵌 data URI，返回 HTML 字符串。素材来自显式映射，不访问网络或宿主文件；素材缺失或仍有未物化的外链图片时报错。先调用 `materialize_middle` 和 `validate_materialized_assets`，再渲染 HTML 并内嵌图片。该函数不改变输入语义树或素材集合；需要此能力的宿主使用 `docvortex>=0.5.17,<1`。
+
+### 0.5.16 中文生成空格接口与原生协议
+
+`docvortex.analyzers.pdf.is_generated_cjk_space(left, space, right, *, origins=None) -> bool`
+用于判断相邻 `Char` 记录中的空格是否可以在自然语言物化时忽略。它只接受 PDFium
+明确标记为生成字符的空格，并检查连续源编号、中文边界、同向基线与字形间距；真实空格、
+未知证据、英文字间空格和较大字段间距均保留。函数只返回判定，不修改源字符；
+已有的 `join_tight_text` 使用同一判据。宿主应通过 `docvortex.analyzers.pdf` 导入这两个接口。
+
+`Char` 新增可选的 `is_generated: bool`，没有该字段的旧记录仍可使用。原有公开函数签名
+和 MiddleJson JSON Schema 保持兼容，私有 Python／Rust 协议由 33 升至 34；源码与扩展须配套安装。
+使用这个新接口的 MinerU 或其他宿主需要 `docvortex>=0.5.16,<1`。
+
+### 0.5.9 公开清单补全
+
+0.5.9 将已有的显式导出补入 `PUBLIC_API`，不改变函数签名、结果协议或默认后端选择。
+
+| 职责 | 支持的入口 |
+| --- | --- |
+| 顶层便捷入口 | `docvortex.postprocess_document`、`docvortex.render_artifact`、`docvortex.__version__` |
+| 结果与诊断类型 | `docvortex.result` 的 `Diagnostic`、`MetadataResult`、`AnalysisResult`、`DocumentResult`、`RenderArtifact`、`ExportResult`；除 `Diagnostic` 外也可从顶层导入 |
+| 统一渲染门面 | `docvortex.render` 的格式、选项、输出类型、素材回调和各格式渲染函数；与 `docvortex.render.contracts` 共用类型对象 |
+| 行内内容变换 | `docvortex.content.inline` 的规范化、文本映射、替换、切片与去首尾空白函数 |
+| Span 构造与变换 | `docvortex.content.spans` 的代码、超链接、文本构造，以及扩展、规范化与切片函数 |
+| 子块遍历与列表标记 | `docvortex.content.tree.iter_child_blocks`；`docvortex.render.fragments` 的 `ListItem`、`ListItemKind`、`OrderedListStyle` |
+
+顶层 `render_artifact` 接收 `MiddleJson` 和可选素材并返回 `RenderArtifact`；`docvortex.render.render`
+接收 `MiddleJson` 并返回 `RenderOutput`（字符串、字节或字典）。两者的职责与签名保持原样，调用方应选择对应层级。
+契约测试同时检查清单符号可导入、显式 `__all__` 导出完整登记，以及门面类型身份一致。
+现有兼容的 MinerU 无需修改调用代码；PDF 原生表格、标题与阅读顺序修复由 DocVortex 内部完成。
+
+### Flash 原生布局修复（2026-10-08）
+
+原生布局现在能恢复经字符对齐与当前页表头确认的稀疏财务表，纠正欠分割网格，并改善
+术语标题、正文连续性、公式及局部标题带的阅读顺序。修复同时进入 `PdfModel.predict`、
+顶层 `analyze`／`parse` 和公开的 `prepare_table_page` → `recover_table_region` 路径。
+
+本轮未新增跨库依赖。42 个公开模块、343 个登记符号、1508 个公开类方法签名及
+JSON Schema 与修复前一致；`PUBLIC_API`、块类型、ModelJson／MiddleJson、异常边界和
+结果素材约定保持兼容。Python／Rust 私有扩展协议仍为 32，部署时须构建匹配源码的扩展。
+现有 MinerU 无需更改调用代码或依赖范围。
+
+兼容性检查覆盖 81 项公开接口测试、13 张表的 1018 个独立真值网格位置、完整解析与
+HTML／Markdown／Bundle 回读，以及 MinerU Flash 的 txt／auto 实际入口。
+修复范围及完整回归结果见 [Flash 布局修复验收](flash-layout-repair-2026-10-08.md)。
+
+### 0.5.10 Rust 优化与 MinerU 兼容性
+
+0.5.10 的优化均位于内部内核与适配层。公开的 41 个模块、321 个符号及类方法签名与 0.5.9 一致，
+`PUBLIC_API`、ModelJson／MiddleJson、结果类型、素材格式与 `auto|python|rust` 选择方式不变。
+Python／Rust 私有扩展协议由 30 升至 31；安装包须使用同一版本的 Python 源码和扩展，不应单独替换旧扩展。
+
+现有兼容的 MinerU 无需修改调用代码或依赖范围。原生文字、表格和图片处理自动使用内部优化，
+`PDFRenderSession` 的签名和资源关闭约定保持原样；macOS 页图使用共享内存传递独立像素，其他平台保持原有文件路径。
+本地验证覆盖公开契约、当前 MinerU 的导入边界、文档协议、路由、表格、页面快照与渲染调度；
+性能对照见 [README 性能示例](../README_zh-CN.md#pdf-性能)。
+
+### 图像工具的无 OpenCV 实现（0.5.11）
+
+`docvortex.assets` 的对比度、旋转和 JPEG 裁剪工具不再需要 OpenCV。Rust 位图裁剪的
+连续 BGR 协议保持不变，Python 旋转使用 NumPy，JPEG 共用 Pillow 编码，显式设置
+quality 95、4:2:0 采样、非渐进且不优化编码。临时图像和内存缓冲会在成功与失败时关闭。
+
+`calculate_contrast` 接受 RGB/BGR 三或四通道的 uint8、uint16、float32 图像，沿用灰度舍入、
+忽略 alpha、标准差/均值统计和两位小数。JPEG 高位深输入沿用饱和舍入到 uint8 并忽略 alpha。
+对比度统计的非法形状、空图及不支持的位深使用 `ValueError`；进入 JPEG 编码的非法形状或位深
+同样使用 `ValueError`。空裁框、空裁片和底层 JPEG 编码失败仍返回空字符串。
+`rotate_image_to_upright` 的 90/180/270 度旋转返回独立连续数组，其余角度返回原对象。
+
+公开签名、JSON、素材命名和原生协议 31 保持原样。完整本地验收、性能及 MinerU 自身的
+依赖迁移分析见 [OpenCV 移除报告](opencv-removal.md)。
+
+### 模型图像数值接口（0.5.12）
+
+`docvortex.image` 提供通用图像数值操作，宿主通过此模块调用，不导入 foundation 或原生扩展。
+模块导入只定义接口；NumPy、Pillow 和扩展延迟到真正执行操作时加载。
+公共清单由 41 个模块、321 个符号增加到 42 个模块、343 个符号；新增 19 个函数及
+`Interpolation`、`WarpInterpolation`、`Border` 三个类型别名，既有模块和符号均保持原样。
+
+| 职责 | 公开函数 |
+| --- | --- |
+| 字节解码、灰度与缩放 | `decode_image`、`gray_image`、`resize_image` |
+| 透视、仿射与点变换 | `perspective_matrix`、`affine_matrix`、`rotation_matrix`、`warp_image`、`transform_points` |
+| 轮廓和几何 | `trace_contours`、`simplify_contour`、`minimum_rectangle`、`rectangle_corners`、`contour_area`、`contour_length` |
+| 掩码与推理线 | `label_components`、`morphology`、`rasterize_polygons`、`draw_line`、`draw_lines` |
+
+缩放和采样接受非空 HW/HWC、1–4 通道的 uint8、uint16、float32 数组；灰度转换只接受
+RGB/BGR 三或四通道。输出保留位深、独立且连续可写；HWC 单通道缩放输出 HW。
+解码返回 BGR/BGRA 或灰度，默认保留 alpha、原位深及方向；`color=True` 明确转为三通道，
+`apply_orientation=True` 明确应用 EXIF。十六位多通道 PNG 不经过八位 RGB 中转；无法解码返回 None。
+
+`resize_image(image, (width, height), interpolation="linear")` 使用显式插值名称；可选值为
+nearest、linear、cubic、area、lanczos4。比例入口使用
+`resize_image(image, None, scale=(fx, fy))`，不从舍入后的尺寸反推采样网格。
+`warp_image` 的矩阵表示源到目标，采样逆映射由内核计算；只支持 nearest、linear、cubic，
+边界使用 `constant` 或 `replicate`。最小矩形角度固定在 [-90, 0)，轮廓及八连通域顺序具有确定性。
+抗锯齿推理线接受 uint8 图，批量 `draw_lines` 只在入口物化一次图像。
+
+默认 auto 使用 Rust 数值热循环，Python 参考后端遵守相同契约；两者均不根据 cv2 是否安装
+改变算法。私有扩展协议升级为 32，Python 源码和扩展必须配套。既有 `crop_bitmap_bgr` 协议和
+文档类型、JSON、七种渲染接口保持原样。模型阈值、OCR 排序、UNet 规则及推理策略仍由 MinerU 维护。
+
+本接口自 0.5.12 提供；对应 MinerU 依赖迁移使用同版本轮子验收。验收见
+[OpenCV 迁移记录](opencv-removal.md)。
 
 ## 结果包素材导出（0.4.3）
 

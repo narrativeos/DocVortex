@@ -8,12 +8,14 @@
 
 [![PyPI](https://img.shields.io/pypi/v/docvortex?color=008cff)](https://pypi.org/project/docvortex/)
 [![Python](https://img.shields.io/pypi/pyversions/docvortex)](https://pypi.org/project/docvortex/)
+[![Downloads](https://static.pepy.tech/badge/docvortex)](https://pepy.tech/project/docvortex)
+[![Monthly Downloads](https://static.pepy.tech/badge/docvortex/month)](https://pepy.tech/project/docvortex)
 [![CI](https://github.com/myhloli/DocVortex/actions/workflows/ci.yml/badge.svg)](https://github.com/myhloli/DocVortex/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/myhloli/DocVortex/blob/main/LICENSE.md)
 
 **English** · [简体中文](https://github.com/myhloli/DocVortex/blob/main/README_zh-CN.md)
 
-[Quick start](#quick-start) · [Formats](#supported-formats) · [Documentation](#documentation)
+[Performance](#pdf-performance) · [Quick start](#quick-start) · [Formats](#supported-formats) · [Documentation](#documentation)
 
 </div>
 
@@ -23,18 +25,43 @@ DocVortex is a standalone Python engine for parsing and converting documents.
 It reads native text and document structure into a unified representation,
 then exports the result in the formats your workflow needs.
 
-- **Multi-format input** — read text PDFs, Office files, OpenDocument files, EPUB, HTML, OFD, CSV and TSV.
+- **Multi-format input** — read native-text PDFs, Office files, OpenDocument files, EPUB, HTML, OFD, CSV and TSV.
 - **Parse once, export many times** — reuse the same result for Markdown, HTML, LaTeX, DOCX, EPUB, PDF and structured JSON.
 - **Portable results** — save document structure and image assets in a Bundle, then export again without the source file.
 - **Composable APIs** — use the complete pipeline or integrate analysis, postprocessing and rendering separately.
 
 Native parsing works without an OCR or VLM inference service. Use DocVortex directly through its CLI or Python SDK.
 
+DocVortex does not download models or perform PDF OCR. When OCR is required, it reports `pdf_ocr_unsupported` and asks you to download and install [MinerU](https://github.com/opendatalab/MinerU) to process the document.
+
 ![DocVortex pipeline: native documents become a unified representation, then Markdown, HTML, LaTeX, DOCX, EPUB, PDF or structured JSON.](https://gcore.jsdelivr.net/gh/myhloli/DocVortex@main/docs/images/docvortex-overview.jpg)
+
+## PDF performance
+
+**Release 0.5.10 uses Rust acceleration: public parsing is 2.93× as fast as 0.4.25 on the tested corpus.**
+
+| Pipeline | 0.4.25 python | 0.5.10 rust | Speedup | Time reduction | Peak RSS reduction |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| DocVortex public `parse()` | 42.36 s | 14.48 s | **2.93×** | **65.82%** | **31.17%** |
+| MinerU Flash | 44.50 s | 14.44 s | **3.08×** | **67.55%** | **29.84%** |
+| MinerU shared PDF processing | 76.28 s | 12.85 s | **5.94×** | **83.16%** | **35.65%** |
+
+Same-machine warm-run comparison on 32 PDFs / 299 pages (31 PDFs for Flash). The existing 0.4.25 measurements are reused. For 0.5.10, each document is warmed once and timed five times in each of three balanced rounds; times sum the medians of the three per-document medians. RSS reductions are medians of per-document process-tree peak RSS reductions. MinerU results include improvements in both projects. The shared pipeline excludes model computation; excluding the extreme dense-table sample, its speedup is **2.87×**.
+
+The [non-PDF optimization report](https://github.com/myhloli/DocVortex/blob/main/docs/optimization-final-report-2026-10-25.md) records the original-to-final comparison, per-format timings, memory checks and remaining hotspots.
 
 ## Quick start
 
-Requires **Python 3.10–3.14**.
+Requires **GIL-enabled CPython 3.11–3.14**, **pypdfium2 5.13.0 or newer**, and **ONNX Runtime 1.24.4 or newer** (DirectML on Windows x64).
+On macOS, installation requires **Apple Silicon and macOS 14 or newer**; Intel Macs are no longer supported as of 0.6.0.
+
+Version 0.6 keeps the Python SDK and CLI and requires its bundled Rust native extension.
+Releases contain ABI3 wheels for Linux x86_64/aarch64 (glibc 2.28+), Windows x86_64/ARM64,
+and macOS arm64. Pure Python wheels and source distributions are no longer published.
+PyPy and free-threaded Python are not supported. Starting with 0.6.1, DocVortex ignores the retired
+`DOCVORTEX_BUILD_NATIVE` and `DOCVORTEX_COMPUTE_BACKEND` variables, regardless of their values.
+The 0.6.0 package still rejects these variables.
+Existing 0.5 installations can stay on `docvortex<0.6` while migrating.
 
 ### Install
 
@@ -73,17 +100,19 @@ use `overwrite=True` in Python or `--overwrite` in the CLI to replace them.
 
 ## Supported formats
 
-### Native inputs · 15 formats
+### Native inputs · 20 formats
 
-| Document family | Formats |
+| Document family | File extensions |
 | --- | --- |
-| PDF with native text | PDF |
-| Word & rich text | DOC, DOCX, RTF |
-| Presentations | PPT, PPTX |
-| Spreadsheets | XLS, XLSX, CSV, TSV |
-| OpenDocument | ODT, ODS, ODP |
-| E-books & web documents | EPUB, HTML |
-| Open Fixed-layout Document | OFD |
+| PDF with native text or scanned pages | `.pdf` |
+| Word & rich text | `.doc`, `.docx`, `.rtf` |
+| Presentations | `.ppt`, `.pptx` |
+| Spreadsheets | `.xls`, `.xlsx`, `.csv`, `.tsv` |
+| OpenDocument | `.odt`, `.ods`, `.odp` |
+| E-books | `.epub` |
+| Web documents | `.html`, `.htm`, `.shtml` |
+| Web archives | `.mhtml`, `.mht` |
+| Open Fixed-layout Document | `.ofd` |
 
 ### Outputs · 7 formats
 
@@ -126,8 +155,11 @@ reads metadata without parsing the document body.
 
 ## Choose the right workflow
 
-- **Text PDFs:** native parsing uses the document's existing text and structure. Scanned pages requiring OCR need an external OCR or inference service.
-- **PDF classification:** `docvortex classify report.pdf` returns `txt` or `ocr`. Classification is explicit and does not start inference; parsing does not automatically switch backends.
+- **PDF parsing** defaults to `pdf_structure="auto"`, which uses available Tagged PDF semantics and reading order, with Flash rules for uncovered content. `pdf_structure="off"` selects geometric parsing. The CLI accepts `--pdf-structure auto|off`. Original roles and block associations are recorded in `docvortex_pdf_structure` extensions. [Tagged PDF usage](docs/USAGE.md#tagged-pdf-and-pdfua-native-parsing)
+- **PDF classification** under `parse_mode="auto"` first accepts sufficient structure evidence, then classifies the selected pages as a whole when needed. A `txt` result uses native parsing. An `ocr` result raises `DocumentError` with code `pdf_ocr_unsupported` and a MinerU download link. `parse_mode="txt"` forces native parsing. The CLI accepts `--parse-mode auto|txt|ocr` for PDF input.
+- **PDF OCR:** `parse_mode="ocr"` and `--parse-mode ocr` are retained for compatibility and always report `pdf_ocr_unsupported` for PDF input. Download and install [MinerU](https://github.com/opendatalab/MinerU) for OCR. DocVortex does not install or invoke MinerU automatically.
+- **Mixed PDFs:** auto mode does not classify or switch backends per page. A selection classified as `txt` keeps native parsing even if it contains scanned pages. Use MinerU when those pages need OCR.
+- **PDF classification:** `docvortex classify report.pdf` returns `txt` or `ocr` without inference or networking. Metadata extraction and the low-level `PdfModel.predict()` native text API also remain offline.
 - **PDF export:** PDF sources with page geometry default to block layout restoration, with selectable text and HTML-based tables; charts retain region images. Other sources and older results use semantic reflow. Use `--pdf-layout original|reflow` to select explicitly; fonts, line breaks and drawing instructions are not reproduced losslessly. See [PDF output layout](docs/USAGE.md#pdf-output-layout).
 
 ## Documentation
@@ -136,7 +168,7 @@ reads metadata without parsing the document body.
 | --- | --- |
 | [Usage](https://github.com/myhloli/DocVortex/blob/main/docs/USAGE.md) | Stage APIs, PDF pages, classification, images and Bundles |
 | [Agent skill](skills/docvortex/SKILL.md) | CLI and Python SDK workflows for agents; copy the entire `skills/docvortex` folder to reuse |
-| [Examples](https://github.com/myhloli/DocVortex/blob/main/demo/README.md) | Local PDF and Office samples with a runnable demo |
+| [Examples](https://github.com/myhloli/DocVortex/blob/main/demo/README.md) | Local samples for PDF, Office, EPUB, web documents and OFD with a runnable demo |
 | [Metadata](https://github.com/myhloli/DocVortex/blob/main/docs/METADATA.md) | Source properties and per-format coverage |
 | [JSON protocol](https://github.com/myhloli/DocVortex/blob/main/docs/JSON_PROTOCOL.md) | Document schemas, extensions and protocol migration |
 | [HTML protocol](https://github.com/myhloli/DocVortex/blob/main/docs/HTML_PROTOCOL.md) | Semantic markers and round trips |
@@ -144,6 +176,10 @@ reads metadata without parsing the document body.
 | [Rendering ownership](https://github.com/myhloli/DocVortex/blob/main/docs/RENDER_OWNERSHIP.md) | DocVortex exports and MinerU-specific renderers |
 
 ## Development
+
+See [Repository architecture](docs/ARCHITECTURE.md) for directory responsibilities,
+the Python/Rust boundary, and native development commands. Source builds require the
+Rust toolchain pinned in `rust-toolchain.toml` and the platform's C/C++ linker.
 
 From a local checkout:
 
@@ -153,7 +189,7 @@ uv pip install -e ".[test,dev]"
 uv run --no-project python -m pytest -q
 uv run --no-project ruff check src
 uv run --no-project ruff format --check src
-uv build
+uv build --wheel
 ```
 
 Bug reports and contributions are welcome. When reporting a parsing issue,
