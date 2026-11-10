@@ -97,3 +97,19 @@ def test_visual_parent_block_inherits_main_block_id() -> None:
     assert image_block.type == BlockType.IMAGE
     assert image_block.block_id == "main-id"
     assert [child.block_id for child in image_block.content] == ["main-id", "caption-id"]
+
+
+def test_stable_epub_identifier_ignores_block_id() -> None:
+    """block_id 是生产者的记账字段，不参与 EPUB 的内容指纹。"""
+    from docvortex.render._internal.epub.renderer import _stable_identifier
+
+    def build(block_id: str | None) -> MiddleJson:
+        return MiddleJson(
+            pages=[{"page_idx": 0, "blocks": [{**_text_block_payload(block_id), "index": 0}]}],
+            is_full_document=True,
+            metadata={"file_suffix": "pdf", "producer": Producer(name="docvortex", version="test")},
+            extensions={},
+        )
+
+    kwargs = {"title": "Doc", "authors": (), "language": "en"}
+    assert _stable_identifier(build("id-a"), **kwargs) == _stable_identifier(build(None), **kwargs)
