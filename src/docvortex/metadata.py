@@ -11,7 +11,7 @@ from .schema import FILE_SUFFIXES, DocumentMetadata, DocumentProperties, FileSuf
 from .version import __version__
 
 _OOXML_SUFFIXES = frozenset({"docx", "pptx", "xlsx"})
-_METADATA_INPUT_LIMIT = 512 * 1024 * 1024
+_METADATA_INPUT_LIMIT = 1024 * 1024 * 1024
 
 if TYPE_CHECKING:
     from .document.contracts import HtmlSourceContext
@@ -59,7 +59,9 @@ def extract_metadata(
         if suffix not in FILE_SUFFIXES:
             raise InvalidRequestError("file_type_unsupported", f"Unsupported native input format: {suffix}", "file_suffix")
         if data is not None and len(data) > _METADATA_INPUT_LIMIT and suffix not in _OOXML_SUFFIXES:
-            raise DocumentError("resource_limit", "Metadata input exceeds 512 MiB")
+            raise DocumentError(
+                "resource_limit", f"Metadata input exceeds {_METADATA_INPUT_LIMIT // (1024 * 1024)} MiB"
+            )
         if path is not None and suffix in _OOXML_SUFFIXES and data is None:
             properties, messages = _read_properties(path, cast(FileSuffix, suffix), document, source_context)
         else:
